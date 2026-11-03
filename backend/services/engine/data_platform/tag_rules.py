@@ -1,10 +1,10 @@
 """个股终端智能标签规则引擎
 
-11 大类 + 25 个常用组合预设。基于 QuantDB 本地最新交易日快照
+10 大类 + 24 个常用组合预设。基于 QuantDB 本地最新交易日快照
 （instrument_detail + technical_indicators + valuation + l1_factors + l1_l2_factors + margin_trading），
 按 symbol 合并后向量化匹配。进程内缓存 5 分钟。
 
-规则 = {id, name, category, desc, cond: (metric, op, threshold), sort_key, sort_asc}
+规则 = {id, name, category, desc, cond: (metric, op, threshold|(lo,hi)), sort_key, sort_asc}
 metric 在 _METRICS 中定义；op ∈ {gt, lt, ge, le, between}。
 preset 引用多个 tag id，logic ∈ {any, all}。
 """
@@ -41,12 +41,12 @@ def _build_metrics() -> pd.DataFrame:
             return pd.DataFrame()
 
     ti = latest_rows("qdb_technical_indicators", [
-        "close", "pct_change", "vol_std_20", "vol_atr_14", "return_5d", "return_20d",
-        "return_60d", "ma_gap_20", "rsi_14", "vol_to_ma5", "vol_to_ma20",
-        "volume_trend_3d", "macd_hist", "beta_20",
+        "close", "pct_change", "vol_std_20", "vol_atr_14", "ma_gap_20", "rsi_14",
+        "vol_to_ma5", "vol_to_ma20", "volume_trend_3d", "macd_hist", "beta_20",
     ])
-    # 注：schema_adapter 已将 parquet 的 future_return_Nd 别名为 return_Nd，
-    # 规则阈值仍按百分数口径（与改名前一致）。
+    # 注：上游已把 return_Nd 改名为 future_return_Nd（见 docs/A股策略模板_50个设计说明.md），
+    # 该列是「未来收益标签」，不能当过去动量用，故本查询不再请求它；
+    # 过去动量统一取 l1_factors.mom_ret_*d（小数口径），下方换算成百分数。
     val = latest_rows("qdb_valuation", [
         "pe_ttm", "pe_static", "pb", "ps_ttm", "dividend_rate", "total_mv",
         "float_mv", "net_profit_ttm", "revenue_ttm", "equity",
@@ -125,10 +125,33 @@ def _build_metrics() -> pd.DataFrame:
     _fiv = df["float_mv"] if "float_mv" in df.columns else df.get("Ltsz")
     df["total_mv_yi"] = num(_mv) / 1e8
     df["float_mv_yi"] = num(_fiv) / 1e8
-    df["margin_ratio"] = num(df.get("finance_balance")) / df["float_mv_yi"] * 100  # 融资余额/流通市值 %
+    # finance_balance 上游单位是「万元」、float_mv_yi 是「亿元」，需再除以 1e4；
+    # 旧写法把它当「元」用，结果比真实值大 1e4 倍，导致 margin_high 恒为真。
+    df["margin_ratio"] = num(df.get("finance_balance")) / 1e4 / df["float_mv_yi"] * 100
+    df.loc[~df["margin_ratio"].between(-1e6, 1e6), "margin_ratio"] = float("nan")
     df["_st"] = df.get("Name", pd.Series(index=df.index)).astype(str).str.contains("ST", na=False)
     df["sentiment"] = num(df.get("buy_pressure")) - num(df.get("sell_pressure"))
     df["growth_score"] = (num(df.get("mom_ret_20d")) + num(df.get("mom_ret_60d"))) / 2 * 100
+    # l1 的 mom_ret_*d 是小数（0.042614 = 4.261%，已用 close 现算交叉验证），
+    # 规则阈值按百分数，这里统一换算，避免「与阈值单位不一致导致永不命中」。
+    df["mom_5d_pct"] = num(df.get("mom_ret_5d")) * 100
+    df["mom_20d_pct"] = num(df.get("mom_ret_20d")) * 100
+    df["mom_60d_pct"] = num(df.get("mom_ret_60d")) * 100
+    # --- 单位归一：上游这些列是「小数/0-1」口径，而规则阈值按百分数写死 ---
+    # 实测横截面：turn_20 0.0026~0.146、ind_strength_20 -0.29~0.33、
+    # ind_rotation_speed_20 0~0.66、ind_crowding_20 0.008~1、
+    # chip_profit_ratio_20 0~0.986、concept_crowding_max 0.23~1
+    for _pct_col in (
+        "turn_20",
+        "ind_strength_20",
+        "ind_rotation_speed_20",
+        "ind_crowding_20",
+        "chip_profit_ratio_20",
+        "concept_crowding_max",
+    ):
+        df[_pct_col] = num(df.get(_pct_col)) * 100
+    # concept_hot_score 上游 0~10，阈值按 0~100 写死，故 ×10
+    df["concept_hot_score"] = num(df.get("concept_hot_score")) * 10
     df["roe_ok"] = num(df.get("fun_roe")) > 8
     df["peg_ok"] = num(df.get("fun_peg")) < 1.5
 
@@ -176,7 +199,7 @@ def _num(v: Any) -> float | None:
 
 class TagRule:
     def __init__(self, tid: str, name: str, category: str, desc: str,
-                 cond: tuple[str, str, float] | None,
+                 cond: tuple[str, str, float | tuple[float, float]] | None,
                  sort_key: str | None = None, sort_asc: bool = False):
         self.id = tid
         self.name = name
@@ -202,7 +225,11 @@ class TagRule:
         elif op == "le":
             ok = v <= th
         elif op == "between":
-            ok = th <= v <= th + 1
+            # 支持二元组区间 (lo, hi)；标量写法保留旧语义 th..th+1（历史兼容）
+            if isinstance(th, (tuple, list)) and len(th) == 2:
+                ok = th[0] <= v <= th[1]
+            else:
+                ok = th <= v <= th + 1
         else:
             ok = False
         return ok, v
@@ -219,31 +246,30 @@ TAGS: list[TagRule] = [
 
     # ---- 规模与流动性 ----
     TagRule("large_cap", "超大盘蓝筹", "规模与流动性", "总市值>3000亿", ("total_mv_yi", "gt", 3000), sort_key="total_mv_yi"),
-    TagRule("mid_cap", "中盘股", "规模与流动性", "总市值300~3000亿", ("total_mv_yi", "between", 300), sort_key="total_mv_yi"),
+    TagRule("mid_cap", "中盘股", "规模与流动性", "总市值300~3000亿", ("total_mv_yi", "between", (300, 3000)), sort_key="total_mv_yi"),
     TagRule("small_cap", "小盘股", "规模与流动性", "总市值<100亿", ("total_mv_yi", "lt", 100), sort_key="total_mv_yi", sort_asc=True),
     TagRule("active_small", "小盘活跃", "规模与流动性", "小市值+高换手", ("turn_20", "gt", 5), sort_key="fun_turnover_20"),
     TagRule("liquid", "流动性筛选", "规模与流动性", "流动性评分靠前", ("amt_ratio_5_20", "gt", 1.2), sort_key="liq_amount_ratio_5"),
 
     # ---- 行业板块 ----
-    TagRule("industry_strong", "行业强势", "行业板块", "行业强度高", ("ind_strength_20", "gt", 60), sort_key="ind_strength_20"),
-    TagRule("industry_rotation", "行业轮动", "行业板块", "行业轮动加速", ("ind_rotation_speed_20", "gt", 55), sort_key="ind_rotation_speed_20"),
-    TagRule("sector_hot", "行业热度", "行业板块", "行业拥挤度高", ("ind_crowding_20", "gt", 55), sort_key="ind_crowding_20"),
+    TagRule("industry_strong", "行业强势", "行业板块", "行业强度高", ("ind_strength_20", "gt", 15), sort_key="ind_strength_20"),
+    TagRule("industry_rotation", "行业轮动", "行业板块", "行业轮动加速", ("ind_rotation_speed_20", "gt", 25), sort_key="ind_rotation_speed_20"),
+    TagRule("sector_hot", "行业热度", "行业板块", "行业拥挤度高", ("ind_crowding_20", "gt", 97), sort_key="ind_crowding_20"),
 
     # ---- 价值与成长 ----
     TagRule("low_pe_bluechip", "低估值蓝筹", "价值与成长", "PE(TTM)<15 且大市值", ("pe_ttm", "lt", 15), sort_key="pe_ttm", sort_asc=True),
     TagRule("high_roe_growth", "高ROE成长", "价值与成长", "ROE>15 且 PEG<1.5", ("fun_roe", "gt", 15), sort_key="fun_roe"),
-    TagRule("pb_broken", "破净价值", "价值与成长", "PB<1 破净", ("pb", "between", 0), sort_key="pb", sort_asc=True),
+    TagRule("pb_broken", "破净价值", "价值与成长", "PB<1 破净", ("pb", "between", (0, 1)), sort_key="pb", sort_asc=True),
     TagRule("high_dividend", "高股息价值", "价值与成长", "股息率>3%", ("dividend_rate", "gt", 0.03), sort_key="dividend_rate"),
     TagRule("beta_style", "高Beta风格", "价值与成长", "Beta>1.1", ("style_beta_20", "gt", 1.1), sort_key="style_value_20"),
     TagRule("low_vol_quality", "低波质量", "价值与成长", "低波动+高ROE", ("vol_parkinson_20", "lt", 0.03), sort_key="vol_parkinson_20", sort_asc=True),
-    TagRule("gross_margin_quality", "高毛利稳健", "价值与成长", "高毛利稳健", ("gross_margin", "gt", 40), sort_key="gross_margin"),
 
     # ---- 技术形态 ----
-    TagRule("breakout", "突破强势", "技术形态", "20日动量强", ("return_20d", "gt", 10), sort_key="return_20d"),
-    TagRule("oversold_rebound", "超跌反弹", "技术形态", "60日跌深+RSI低", ("return_60d", "lt", -10), sort_key="return_60d", sort_asc=True),
-    TagRule("momentum", "动量强势", "技术形态", "5日动量强", ("mom_ret_5d", "gt", 5), sort_key="mom_ret_5d"),
+    TagRule("breakout", "突破强势", "技术形态", "20日动量强", ("mom_20d_pct", "gt", 10), sort_key="mom_20d_pct"),
+    TagRule("oversold_rebound", "超跌反弹", "技术形态", "60日跌深+RSI低", ("mom_60d_pct", "lt", -10), sort_key="mom_60d_pct", sort_asc=True),
+    TagRule("momentum", "动量强势", "技术形态", "5日动量强", ("mom_5d_pct", "gt", 5), sort_key="mom_5d_pct"),
     TagRule("trend_break", "趋势突破", "技术形态", "站上MA20且放量", ("ma_gap_20", "gt", 0), sort_key="ma_gap_20"),
-    TagRule("boll_tight", "布林收口", "技术形态", "布林带收口(低波动蓄势)", ("tech_bb_width", "lt", 0.04), sort_key="tech_bb_width", sort_asc=True),
+    TagRule("boll_tight", "布林收口", "技术形态", "布林带收口(低波动蓄势)", ("tech_bb_width", "lt", 0.10), sort_key="tech_bb_width", sort_asc=True),
     TagRule("volume_breakout", "放量突破", "技术形态", "量能放大", ("vol_to_ma5", "gt", 1.5), sort_key="vol_to_ma5"),
     TagRule("rsi_oversold", "RSI超卖", "技术形态", "RSI14<30", ("rsi_14", "lt", 30), sort_key="rsi_14", sort_asc=True),
 
@@ -252,12 +278,12 @@ TAGS: list[TagRule] = [
     TagRule("fund_inflow", "资金流入", "资金趋势", "资金净流入比例高", ("flow_net_ratio", "gt", 0.05), sort_key="flow_net_ratio"),
 
     # ---- 主题热点 ----
-    TagRule("concept_hot", "概念热点", "主题热点", "概念热度高", ("concept_hot_score", "gt", 55), sort_key="concept_hot_score"),
+    TagRule("concept_hot", "概念热点", "主题热点", "概念热度高", ("concept_hot_score", "gt", 20), sort_key="concept_hot_score"),
     TagRule("concept_rotation", "概念轮动", "主题热点", "概念轮动加速", ("concept_rotation_score", "gt", 55), sort_key="concept_rotation_score"),
-    TagRule("concept_crowded", "概念拥挤", "主题热点", "概念拥挤度高", ("concept_crowding_max", "gt", 60), sort_key="concept_crowding_max"),
+    TagRule("concept_crowded", "概念拥挤", "主题热点", "概念拥挤度高", ("concept_crowding_max", "gt", 99.5), sort_key="concept_crowding_max"),
 
     # ---- 筹码分析 ----
-    TagRule("chip_concentrated", "筹码集中", "筹码分析", "筹码集中度高", ("chip_concentration_20", "lt", 0.5), sort_key="chip_concentration_20", sort_asc=True),
+    TagRule("chip_concentrated", "筹码集中", "筹码分析", "筹码集中度高", ("chip_concentration_20", "lt", 0.10), sort_key="chip_concentration_20", sort_asc=True),
     TagRule("chip_profit_high", "获利盘多", "筹码分析", "获利盘比例高", ("chip_profit_ratio_20", "gt", 80), sort_key="chip_profit_ratio_20"),
 
     # ---- 市场情绪 ----
@@ -266,9 +292,6 @@ TAGS: list[TagRule] = [
     # ---- 融资融券 ----
     TagRule("margin_net_in", "融资加仓", "融资融券", "融资净买入为正", ("finance_net", "gt", 0), sort_key="finance_net"),
     TagRule("margin_high", "高杠杆持仓", "融资融券", "融资余额占比高", ("margin_ratio", "gt", 5), sort_key="margin_ratio"),
-
-    # ---- 因子选股 ----
-    TagRule("alpha112", "因子Alpha112", "因子选股", "Alpha112 因子筛选", ("alpha112", "gt", 0), sort_key="alpha112"),
 ]
 
 
@@ -287,7 +310,6 @@ PRESETS: list[dict[str, Any]] = [
     {"id": "preset_margin_add", "name": "融资加仓", "tags": ["margin_net_in"], "logic": "all"},
     {"id": "preset_fund_inflow", "name": "资金流入", "tags": ["fund_inflow"], "logic": "all"},
     {"id": "preset_dividend", "name": "高股息价值", "tags": ["high_dividend"], "logic": "all"},
-    {"id": "preset_gross_margin", "name": "高毛利稳健", "tags": ["gross_margin_quality"], "logic": "all"},
     {"id": "preset_chip", "name": "筹码集中", "tags": ["chip_concentrated"], "logic": "all"},
     {"id": "preset_main_accum", "name": "主力吸筹", "tags": ["main_flow_in", "chip_profit_high"], "logic": "all"},
     {"id": "preset_ind_strong", "name": "行业强势", "tags": ["industry_strong"], "logic": "all"},
