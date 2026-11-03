@@ -24,8 +24,9 @@ services:
       timeout: 5s
       retries: 5
     restart: unless-stopped
-    ports:
-      - "127.0.0.1:5432:5432"
+    # 不发布宿主端口：macOS 上发布 127.0.0.1:5432 会静默劫持 Mac 的 localhost:5432
+    # 及所有容器的 host.docker.internal:5432（更具体地址优先），会抢走 Postgres.app。
+    # 服务间访问走 compose 内网 db:5432 即可。
     networks:
       - quantmind-net
 
@@ -33,8 +34,8 @@ services:
   redis:
     image: redis:7-alpine
     container_name: quantmind-redis
-    ports:
-      - "127.0.0.1:6379:6379"
+    # 不发布宿主端口：同理避免劫持 Mac localhost:6379 与容器侧 host.docker.internal:6379。
+    # 服务间访问走 compose 内网 redis:6379。
     # maxmemory-policy 必须为 noeviction：本实例同时承载 Celery broker/result backend，
     # allkeys-lru 会在内存压力下静默淘汰队列消息（定时任务表现为"没跑"）。
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction --databases 16 --bind 0.0.0.0
@@ -81,7 +82,7 @@ services:
     # 安全：业务端口保持公网可达（登录/仪表盘用）；数据库/中间件端口仅回环。
     # 容器内仍需 0.0.0.0 监听（见 main_oss.py），宿主机暴露面由本节控制。
     ports:
-      - "8000:8000"  # API Gateway
+      - "18000:8000"  # API Gateway（宿主 8000 已被本机 ds4-serve 占用，映射到 18000）
       - "8001:8001"  # Engine (Qlib回测)
       - "8002:8002"  # Trade (交易服务)
       - "8003:8003"  # Stream (实时行情)
@@ -136,9 +137,12 @@ services:
 
       # 训练期间资源保护：训练开始时 stop 非保护容器以释放内存，结束后自动恢复。
       # 受保护前缀（按容器名前缀匹配，不会被停止）：quantmind* 和 qm-train-* 自身，
-      # 加上 ragflow 套件依赖的基础设施（redis/mysql/es/minio）。
+      # 加上 ragflow 套件依赖的基础设施（redis/mysql/es/minio），
+      # 以及本机共存的另一套平台 baizequant（main_engine / web_dashboard /
+      # strategy_worker_* / broker_service_* / baize_*）——不加这些前缀时，
+      # 一次本地训练会把白泽全部容器 docker stop 掉。
       - TRAINING_PAUSE_OTHERS=true
-      - TRAINING_PROTECTED_NAME_PREFIXES=quantmind,qm-train-,docker-redis-,docker-mysql-,docker-es01-,docker-minio-
+      - TRAINING_PROTECTED_NAME_PREFIXES=quantmind,qm-train-,docker-redis-,docker-mysql-,docker-es01-,docker-minio-,main_engine,web_dashboard,strategy_worker_,broker_service_,baize_
 
       # 融资融券股票池文件路径（容器内）
       - MARGIN_STOCK_POOL_PATH=/data/融资融券.json
@@ -359,6 +363,9 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # QwenPaw 共享文件目录
       - qwenpaw-shared:/qwenpaw-shared
+      # 只读复用白泽维护的 A 股 qlib 数据卷：resolve_qlib_provider_uri("CN") 的首个
+      # 候选就是 /data/qlib/cn_data；只读可避免被 QlibDataBuilder 覆盖写坏。
+      - qlib_cn_data:/data/qlib/cn_data:ro
     # deploy:
     #   resources:
     #     reservations:
@@ -535,6 +542,8 @@ services:
       - ./strategy_templates:/app/strategy_templates
       # 用户股票池文件 (AI策略生成)
       - ./user_pools_local:/app/user_pools_local
+      # 回测任务在 worker 执行，同样需要 qlib provider（只读复用白泽卷）
+      - qlib_cn_data:/data/qlib/cn_data:ro
     command: celery -A backend.services.engine.qlib_app.celery_config:celery_app worker -Q ${QLIB_CELERY_QUEUE:-qlib_backtest_srv} --loglevel=info --concurrency=4
     healthcheck:
       test: ["CMD-SHELL", "pgrep -f 'celery.*worker' || exit 1"]
@@ -773,3 +782,7 @@ volumes:
   qwenpaw-secrets:
   qwenpaw-backups:
   qwenpaw-shared:
+  # 外部卷（已存在）：白泽 baizequant 维护的 A 股 qlib 数据，QuantMind 只读复用
+  qlib_cn_data:
+    external: true
+    name: qlib_cn_data
