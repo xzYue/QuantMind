@@ -105,11 +105,13 @@ export default defineConfig(({ mode }) => {
       host: '0.0.0.0', // 允许外部访问
       proxy: {
         '/api': {
-          target: process.env.VITE_API_URL || 'http://localhost:8000',
+          // VITE_PROXY_TARGET：只做服务端转发、浏览器保持同源访问（localhost:3001），
+          // 避开 macOS 系统代理对 127.0.0.1:PORT 直连请求的劫持。未设置时行为不变。
+          target: process.env.VITE_PROXY_TARGET || process.env.VITE_API_URL || 'http://localhost:8000',
           changeOrigin: true,
         },
         '/ws': {
-          target: process.env.VITE_WS_URL || 'ws://localhost:8000',
+          target: process.env.VITE_PROXY_TARGET ? process.env.VITE_PROXY_TARGET.replace(/^http/, 'ws') : (process.env.VITE_WS_URL || 'ws://localhost:8000'),
           ws: true,
         },
         '/api/tencent': {
