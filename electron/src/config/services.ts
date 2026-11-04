@@ -66,10 +66,22 @@ function persistServerUrl(url: string | null): void {
 }
 
 /**
- * 检测是否为 Electron 桌面环境
+ * 检测是否为 Electron 桌面环境。
+ * 注意：utils/electronCompat 在纯浏览器里也会注入 window.electronAPI shim，
+ * 不能只凭它的存在判定桌面端——否则 Web 端会被误判，API base 落到
+ * DEFAULT_ELECTRON_API_BASE（http://127.0.0.1:8000），再叠加 authService
+ * 「构造时算 apiPrefix、请求时重算 baseURL」的分裂，最终发出裸路径
+ * /auth/login（丢失 /api/v1 前缀）而被网关 404。
+ * 判别口径与 TitleBar 一致：UA 由 Electron 主进程注入，最可靠且在页面
+ * 生命周期内恒定（不受 shim 注入时机影响）。
  */
 export function isElectronEnv(): boolean {
-  return typeof window !== 'undefined' && typeof (window as any).electronAPI === 'object';
+  return (
+    typeof window !== 'undefined' &&
+    typeof (window as any).electronAPI === 'object' &&
+    typeof navigator !== 'undefined' &&
+    /Electron\//i.test(navigator.userAgent || '')
+  );
 }
 
 /**
