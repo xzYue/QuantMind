@@ -11,7 +11,7 @@ cd "$PROJECT_ROOT/electron"
 
 # 默认配置
 HOST="${VITE_HOST:-0.0.0.0}"
-PORT="${VITE_PORT:-3000}"
+PORT="${VITE_PORT:-3001}"   # 默认 3001：宿主 3000 常被其它服务占用（如 grafana）
 
 echo "========================================"
 echo "QuantMind Web Frontend (Production)"

@@ -11,7 +11,7 @@ cd "$PROJECT_ROOT"
 
 # 默认配置
 HOST="${VITE_HOST:-0.0.0.0}"
-PORT="${VITE_PORT:-3000}"
+PORT="${VITE_PORT:-3001}"   # 默认 3001：宿主 3000 常被其它服务占用（如 grafana）
 API_URL="${VITE_API_URL:-http://localhost:8000}"
 WS_URL="${VITE_WS_URL:-ws://localhost:8000}"
 

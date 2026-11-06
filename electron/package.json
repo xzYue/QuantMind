@@ -7,9 +7,9 @@
   "type": "commonjs",
   "author": "",
   "scripts": {
-    "dev": "cross-env VITE_PORT=3000 concurrently \"npm:dev:react\" \"npm:dev:electron\"",
+    "dev": "cross-env VITE_PORT=3001 concurrently \"npm:dev:react\" \"npm:dev:electron\"",
     "dev:react": "vite",
-    "dev:electron": "npm run build:electron && wait-on tcp:3000 && cross-env VITE_DEV=1 electron .",
+    "dev:electron": "npm run build:electron && wait-on tcp:3001 && cross-env VITE_DEV=1 electron .",
     "dev:simple": "node scripts/electron-dev.js",
     "build": "npm run build:react && npm run build:electron",
     "build:react": "node ../scripts/frontend/copy-monaco-assets.js && vite build",

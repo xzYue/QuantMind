@@ -282,7 +282,7 @@ interface Window {
 | `VITE_WS_BASE_URL` | WebSocket 地址 | `ws://127.0.0.1:8003/api/v1/ws/market` |
 | `VITE_USER_API_URL` | 用户认证 API 地址（可选） | `http://127.0.0.1:8000/api/v1` |
 | `VITE_API_URL` | 开发代理目标 | `http://localhost:8000` |
-| `VITE_PORT` | Vite 开发端口 | `3000` |
+| `VITE_PORT` | Vite 开发端口 | `3001` |
 | `VITE_DEV` | 开发模式标志 | `1` |
 | `UPDATE_SERVER_URL` | 自动更新服务器 | `https://updates.example.com` |
 | `CSC_IDENTITY_AUTO_DISCOVERY` | 跳过代码签名 | `false` |
@@ -579,10 +579,10 @@ ls dist-react/
 **问题**: 开发模式无法连接 Vite
 ```bash
 # 检查 Vite 是否正常运行
-curl http://localhost:3000
+curl http://localhost:3001
 
 # 手动指定端口
-VITE_PORT=3000 npm run dev
+VITE_PORT=3001 npm run dev
 ```
 
 **问题**: 生产模式白屏

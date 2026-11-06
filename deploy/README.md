@@ -95,7 +95,7 @@ curl http://127.0.0.1:8000/health
 
 | 服务 | 默认端口 |
 | --- | --- |
-| Web | 3000 |
+| Web | 3001 |
 | API / Engine / Trade / Stream | 8000 / 8001 / 8002 / 8003 |
 | Data Gateway | 8004 |
 | Huntly / RSSHub / QwenPaw | 8090 / 1200 / 8088 |

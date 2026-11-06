@@ -292,15 +292,17 @@ function createWindow() {
 
   if (isDev) {
     console.log('[main] Starting in development mode');
-    const port = process.env.VITE_PORT || '3000';
-    // 支持多个端口，处理端口冲突情况
-    const devUrls = [
+    // 默认 3001，与 electron/vite.config.ts 的 DEFAULT_WEB_PORT 保持一致：
+    // 宿主 3000 常被其它服务占用（本机是 baize_grafana 容器），而 Vite 开了 strictPort。
+    const port = process.env.VITE_PORT || '3001';
+    // 支持多个端口，处理端口冲突情况（去重，避免默认端口已在列表里时重复尝试）
+    const devUrls = Array.from(new Set([
       `http://127.0.0.1:${port}`,
       'http://127.0.0.1:3001',
       'http://127.0.0.1:3002',
       'http://127.0.0.1:3003',
       'http://127.0.0.1:5173'  // Vite默认端口
-    ];
+    ]));
 
     handleDevMode(devUrls);
     mainWindow.webContents.openDevTools({ mode: 'detach' });

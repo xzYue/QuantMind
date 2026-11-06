@@ -35,7 +35,7 @@ try {
     console.log('[SIMPLE] Window created');
 
     // 尝试加载开发服务器
-    mainWindow.loadURL('http://127.0.0.1:3000')
+    mainWindow.loadURL('http://127.0.0.1:3001')
       .then(() => {
         console.log('[SIMPLE] Dev server loaded successfully');
         mainWindow.webContents.openDevTools({ mode: 'detach' });

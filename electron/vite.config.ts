@@ -8,6 +8,13 @@ import react from '@vitejs/plugin-react';
 // Electron 桌面版使用绝对路径
 const apiBase = process.env.VITE_API_URL || process.env.VITE_API_BASE_URL || '';
 const wsBase = process.env.VITE_WS_BASE_URL || '';
+
+// Web 开发端口默认 3001。
+// 宿主 3000 常被其它服务占用（本机 baize_grafana 容器即长期占用 3000），
+// 而下面的 server.strictPort = true 意味着端口被占时直接启动失败、不会自动换端口，
+// 所以把默认值定为 3001，避免每次都要手工传 VITE_PORT。
+// 需要其它端口时仍可显式覆盖：VITE_PORT=xxxx npm run dev:react。
+const DEFAULT_WEB_PORT = 3001;
 const pkgVersion = JSON.parse(
   readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf-8')
 ).version as string;
@@ -100,7 +107,7 @@ export default defineConfig(({ mode }) => {
       }
     },
     server: {
-      port: parseInt(process.env.VITE_PORT || '3000'),
+      port: parseInt(process.env.VITE_PORT || String(DEFAULT_WEB_PORT), 10),
       strictPort: true,
       host: '0.0.0.0', // 允许外部访问
       proxy: {

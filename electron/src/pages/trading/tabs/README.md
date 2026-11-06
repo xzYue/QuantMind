@@ -6,7 +6,7 @@
 
 原因：
 
-- Electron/Vite 开发环境默认运行在 `http://127.0.0.1:3000`
+- Electron/Vite 开发环境默认运行在 `http://127.0.0.1:3001`
 - 本地 dev server 未配置通用 `/api` 代理
 - 使用相对路径（如 `/api/v1/...`）会命中前端 dev server 并返回 `404`
 

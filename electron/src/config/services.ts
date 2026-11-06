@@ -4,7 +4,7 @@
  */
 export const SERVICE_PORTS = {
   // 前端服务
-  FRONTEND_DEV: 3000,
+  FRONTEND_DEV: 3001,   // 与 vite.config.ts 的 DEFAULT_WEB_PORT 一致（3000 常被其它服务占用）
 
   // 后端服务 (统一通过网关 8000)
   API_GATEWAY: 8000,
