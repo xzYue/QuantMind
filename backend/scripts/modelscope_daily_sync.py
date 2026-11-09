@@ -4,8 +4,9 @@
 
 背景：本机 data/quantdb 的全量数据即来自魔搭（ModelScope）公开数据集仓库
 （默认 qusong0627/LightGBM_Alpha300，与管理台「初始化数据」同一来源）。
-本脚本面向每日 cron：枚举远端清单 → 与本地同步状态库（多副本合并）diff →
-只下载新增/内容变化的 parquet，然后走与 quantdb_daily_sync 相同的下游修复链路。
+本脚本按使用者配置的 cron 运行（示例为每天 07:00）：枚举远端清单 → 与本地
+同步状态库（多副本合并）diff → 只下载新增/内容变化的 parquet，然后走与
+quantdb_daily_sync 相同的下游修复链路。
 
 数据流:
   1. 增量下载：逐文件 sha256+size 校验、.part 原子替换；每批完成即把登记
@@ -37,11 +38,23 @@
   python3 backend/scripts/modelscope_daily_sync.py --max-pending-gb 20
   python3 backend/scripts/modelscope_daily_sync.py --allow-large
 
+  # 只同步 L1 所需数据集：排除 L2 宽表（单次全历史重算可省几十 GB）
+  python3 backend/scripts/modelscope_daily_sync.py \
+      --skip-datasets factor_dictionary,l1_l2_factors --max-pending-gb 30
+  # 被排除的数据集不计入 pending / 不参与护栏 / 不下载，
+  # 只在报告里单列为 skipped_by_config（含「本来要下多少」的统计）。
+  # 注意：仅影响增量同步，不影响管理台「ModelScope 初始化」（init 仍是全量对齐）；
+  # 上游每次发布可能做全历史重算，跳过后剩余量仍可能超过默认 10GiB 护栏，
+  # 需要显式调高上限（示例见下）或用 --allow-large 放行。
+
   # 本地状态（不联网）：各数据集最新分区、状态库副本、磁盘余量
   python3 backend/scripts/modelscope_daily_sync.py --status
 
-crontab 示例（每天 08:30 容器内执行；非交易日/上游未发布时自动 no-op）:
-  30 8 * * * PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" no_proxy='*' NO_PROXY='*' docker exec quantmind python /app/backend/scripts/modelscope_daily_sync.py >> /tmp/modelscope_daily_sync.log 2>&1
+crontab 示例（每天 07:00 容器内执行；上游未发布时自动 no-op）:
+  0 7 * * * PATH="/opt/homebrew/bin:/usr/local/bin:$PATH" no_proxy='*' NO_PROXY='*' docker exec quantmind python /app/backend/scripts/modelscope_daily_sync.py --skip-datasets factor_dictionary,l1_l2_factors --max-pending-gb 30 >> /tmp/modelscope_daily_sync.log 2>&1
+
+  注：全历史重算的那一周，跳过后剩余量实测约 12.2GiB，超过默认 10GiB 护栏会
+  exit 2（一个字节都不下），因此示例显式给 --max-pending-gb 30。
 
 注：遵循仓库约定不内置默认调度（AGENTS.md「市场数据同步不内置默认调度」），
 是否挂 cron 由使用者决定。退出码：0=成功/无更新/预检，1=部分失败（下载或
@@ -222,6 +235,7 @@ def _record_event(summary: dict, downloaded: int) -> None:
 def run_modelscope_daily_sync(
     *,
     datasets: list[str] | None = None,
+    skip_datasets: list[str] | None = None,
     check: bool = False,
     max_pending_gb: float = DEFAULT_MAX_PENDING_GB,
     allow_large: bool = False,
@@ -273,6 +287,7 @@ def run_modelscope_daily_sync(
     try:
         sync = sync_incremental_from_modelscope(
             datasets,
+            skip_datasets=skip_datasets,
             dry_run=check,
             max_pending_bytes=int(max_pending_gb * 1024**3),
             allow_large=allow_large,
@@ -293,6 +308,16 @@ def run_modelscope_daily_sync(
             },
             finished=datetime.now().isoformat(),
         )
+        # 仅在实际生效（且与 --datasets 求交后非空）时附带跳过信息，避免误报
+        _eff_skip = {str(s).strip() for s in (skip_datasets or ()) if str(s).strip()}
+        if datasets is not None:
+            _eff_skip &= set(datasets)
+        if _eff_skip:
+            summary["skipped_datasets"] = sorted(_eff_skip)
+            summary["hint"] = (
+                "被 --skip-datasets 排除的数据集已不计入该 pending；剩余量仍按 "
+                "--max-pending-gb 判定，确认后可调高上限或用 --allow-large 放行"
+            )
         return summary
 
     # dry_run 的 summary 本身就是对账报告（字段在顶层）；正式同步嵌在 "diff"
@@ -318,6 +343,8 @@ def run_modelscope_daily_sync(
             "total_pending_bytes": diff.get("total_pending_bytes"),
         },
     }
+
+    summary["skipped_by_config"] = diff.get("skipped_by_config") or {}
 
     if check:
         summary["status"] = "checked"
@@ -364,7 +391,15 @@ def run_modelscope_daily_sync(
     db_ok, db_target = _db_reachable()
     log.info("PG 可达性: %s (%s)", "可达" if db_ok else "不可达", db_target)
 
-    includes_l1 = datasets is None or "l1_factors" in datasets
+    # 以报告里的实际同步范围为准；diff 缺 datasets（如测试桩）时退回按参数推断
+    _sync_ds = diff.get("datasets") or {}
+    if _sync_ds:
+        includes_l1 = "l1_factors" in _sync_ds
+    else:
+        _skip_set = set(skip_datasets or ())
+        includes_l1 = (
+            datasets is None or "l1_factors" in datasets
+        ) and "l1_factors" not in _skip_set
     days = (
         pg_days
         if pg_days is not None
@@ -481,6 +516,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--datasets", type=str, default=None, help="逗号分隔数据集名（默认=仓库内全部）"
     )
+    parser.add_argument(
+        "--skip-datasets",
+        type=str,
+        default=None,
+        help=(
+            "逗号分隔、要从本次同步中排除的数据集名（如 factor_dictionary,l1_l2_factors）；"
+            "被排除项不计入 pending、不参与护栏、不下载，只单列在 skipped_by_config"
+        ),
+    )
     parser.add_argument("--repo", dest="repo_id", default=None, help="覆盖魔搭仓库 id")
     parser.add_argument("--revision", default=None, help="覆盖魔搭 revision")
     parser.add_argument("--endpoint", default=None, help="覆盖魔搭 endpoint")
@@ -548,9 +592,42 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             return 2
+
+    skip_datasets: list[str] | None = None
+    if args.skip_datasets is not None:
+        skip_datasets = [s.strip() for s in args.skip_datasets.split(",") if s.strip()]
+        if not skip_datasets:
+            log.error("--skip-datasets 为空：请提供逗号分隔的数据集名")
+            print(
+                json.dumps(
+                    {"status": "fatal", "error": "--skip-datasets 为空"},
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        from backend.shared.quantdb_datasets import DATASETS as _DATASETS
+
+        _known = {d.dataset for d in _DATASETS}
+        _unknown = sorted(set(skip_datasets) - _known)
+        if _unknown:
+            _msg = f"未知数据集: {', '.join(_unknown)}"
+            log.error("--skip-datasets %s", _msg)
+            print(json.dumps({"status": "fatal", "error": _msg}, ensure_ascii=False))
+            return 2
+        if datasets is not None:
+            _left = [d for d in datasets if d not in set(skip_datasets)]
+            if not _left:
+                _msg = "--datasets 与 --skip-datasets 组合后为空"
+                log.error(_msg)
+                print(
+                    json.dumps({"status": "fatal", "error": _msg}, ensure_ascii=False)
+                )
+                return 2
+
     try:
         summary = run_modelscope_daily_sync(
             datasets=datasets,
+            skip_datasets=skip_datasets,
             check=args.check,
             max_pending_gb=args.max_pending_gb,
             allow_large=args.allow_large,

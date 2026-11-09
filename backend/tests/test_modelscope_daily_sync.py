@@ -800,3 +800,291 @@ def test_main_empty_datasets_usage_error(capsys):
     assert rc == 2
     out = capsys.readouterr().out
     assert '"fatal"' in out
+
+
+# ---------------------------------------------------------------------------
+# --skip-datasets：按配置排除数据集（不计 pending / 不参与护栏 / 不下载）
+# ---------------------------------------------------------------------------
+def test_diff_skip_datasets_excluded_from_totals(env_root, monkeypatch):
+    keep = _rf(f"{DF}/dt=20260101/data.parquet", b"keep")
+    _write_local(env_root, keep, b"keep")
+    _seed_state(env_root, [keep])
+    new_df = _rf(f"{DF}/dt=20260102/data.parquet", b"new-day")
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide-table",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [keep, new_df, wide])
+
+    report = ms.diff_from_modelscope(skip_datasets=["factor_dictionary"])
+
+    assert "factor_dictionary" not in report["datasets"]
+    assert report["datasets"]["daily_forward"]["pending_files"] == 1
+    assert report["total_pending_files"] == 1
+    skipped = report["skipped_by_config"]
+    assert skipped["datasets"]["factor_dictionary"]["pending_files"] == 1
+    assert skipped["total_pending_bytes"] == len(b"wide-table")
+
+
+def test_sync_skip_datasets_not_downloaded(env_root, monkeypatch):
+    new_df = _rf(f"{DF}/dt=20260102/data.parquet", b"new-day")
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [new_df, wide])
+    _FakeClient.payloads = {new_df.path: b"new-day", wide.path: b"wide"}
+
+    summary = ms.sync_incremental_from_modelscope(skip_datasets=["factor_dictionary"])
+
+    assert summary["downloaded"] == 1
+    assert _FakeClient.stream_calls == 1
+    assert (env_root / new_df.path).exists()
+    assert not (env_root / wide.path).exists()
+    assert summary["diff"]["skipped_by_config"]["total_pending_files"] == 1
+
+
+def test_skip_datasets_guard_ignores_skipped_bytes(env_root, monkeypatch):
+    """护栏只按「实际会下」的 pending 判断：被跳过的大数据集不得触发拦截。"""
+    big = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"x" * 4096,
+        dataset="factor_dictionary",
+    )
+    small = _rf(f"{DF}/dt=20260102/data.parquet", b"ok")
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [big, small])
+    _FakeClient.payloads = {small.path: b"ok"}
+
+    summary = ms.sync_incremental_from_modelscope(
+        skip_datasets=["factor_dictionary"], max_pending_bytes=3
+    )
+    assert summary["downloaded"] == 1
+
+    # 反向对照：不跳过时同一批 pending 会被护栏拦下
+    with pytest.raises(ms.PendingTooLargeError):
+        ms.sync_incremental_from_modelscope(max_pending_bytes=3)
+
+
+def test_skip_outside_whitelist_is_noop(env_root, monkeypatch):
+    new_df = _rf(f"{DF}/dt=20260102/data.parquet", b"new-day")
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [new_df])
+
+    report = ms.diff_from_modelscope(
+        ["daily_forward"], skip_datasets=["factor_dictionary"]
+    )
+
+    assert report["datasets"]["daily_forward"]["pending_files"] == 1
+    assert report["skipped_by_config"]["total_pending_files"] == 0
+
+
+def test_skip_unknown_dataset_raises(env_root, monkeypatch):
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [])
+    with pytest.raises(ValueError, match="未知数据集"):
+        ms.diff_from_modelscope(skip_datasets=["not_a_dataset"])
+
+
+def test_run_skip_l1_skips_backfill_phase(env_root, monkeypatch):
+    monkeypatch.setattr(
+        ms,
+        "sync_incremental_from_modelscope",
+        lambda *a, **k: _fake_sync_summary(env_root),
+    )
+    monkeypatch.setattr(mds, "_db_reachable", lambda timeout=3.0: (False, "db:5432"))
+
+    summary = mds.run_modelscope_daily_sync(skip_datasets=["l1_factors"])
+
+    phase = summary["phases"]["l1_ohlcv_backfill"]
+    assert phase["status"] == "skipped"
+    assert "l1_factors" in phase["reason"]
+
+
+def test_main_skip_unknown_dataset_exit_2(capsys):
+    rc = mds.main(["--skip-datasets", "not_a_dataset"])
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert '"fatal"' in out and "未知数据集" in out
+
+
+def test_main_skip_empties_whitelist_exit_2(capsys):
+    rc = mds.main(["--datasets", "daily_forward", "--skip-datasets", "daily_forward"])
+
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "组合后为空" in out
+
+
+def test_check_mode_reports_skipped_by_config(env_root, monkeypatch):
+    new_df = _rf(f"{DF}/dt=20260102/data.parquet", b"new-day")
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [new_df, wide])
+
+    summary = mds.run_modelscope_daily_sync(
+        check=True, skip_datasets=["factor_dictionary"]
+    )
+
+    assert summary["status"] == "checked"
+    assert summary["sync"]["remote"]["total_pending_files"] == 1
+    assert summary["skipped_by_config"]["total_pending_files"] == 1
+    assert _FakeClient.stream_calls == 0
+
+
+def test_up_to_date_preserves_skipped_report(env_root, monkeypatch):
+    keep = _rf(f"{DF}/dt=20260101/data.parquet", b"same")
+    _write_local(env_root, keep, b"same")
+    _seed_state(env_root, [keep])
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide-table",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [keep, wide])
+
+    summary = ms.sync_incremental_from_modelscope(skip_datasets=["factor_dictionary"])
+
+    assert summary["status"] == "up_to_date"
+    assert summary["diff"]["skipped_by_config"]["total_pending_files"] == 1
+
+
+def test_skip_partial_whitelist_overlap(env_root, monkeypatch):
+    df = _rf(f"{DF}/dt=20260102/data.parquet", b"df")
+    l1 = _rf(
+        "6_ml_datasets/l1_factors/dt=20260102/data.parquet",
+        b"l1",
+        dataset="l1_factors",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [df, l1])
+
+    report = ms.diff_from_modelscope(
+        ["daily_forward", "l1_factors"], skip_datasets=["l1_factors"]
+    )
+
+    assert set(report["datasets"]) == {"daily_forward"}
+    assert "l1_factors" in report["skipped_by_config"]["datasets"]
+
+
+def test_sync_skip_not_registered_in_state_db(env_root, monkeypatch):
+    df = _rf(f"{DF}/dt=20260102/data.parquet", b"df")
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide",
+        dataset="factor_dictionary",
+    )
+    _seed_state(env_root, [])  # 先建出两个状态库副本，验证「跳过的项不登记」
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [df, wide])
+    _FakeClient.payloads = {df.path: b"df", wide.path: b"wide"}
+
+    ms.sync_incremental_from_modelscope(skip_datasets=["factor_dictionary"])
+
+    for db in _state_db_paths(env_root):
+        rows = _state_rows(db)
+        assert wide.path not in rows
+        assert df.path in rows
+
+
+def test_guard_still_trips_with_skip_when_non_skipped_exceeds(env_root, monkeypatch):
+    big_df = _rf(f"{DF}/dt=20260102/data.parquet", b"x" * 64)
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"y" * 128,
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [big_df, wide])
+
+    with pytest.raises(ms.PendingTooLargeError):
+        ms.sync_incremental_from_modelscope(
+            skip_datasets=["factor_dictionary"], max_pending_bytes=32
+        )
+
+
+def test_main_skip_empty_string_exit_2(capsys):
+    rc = mds.main(["--skip-datasets", " , "])
+
+    assert rc == 2
+    assert '"fatal"' in capsys.readouterr().out
+
+
+def test_skip_all_datasets_up_to_date(env_root, monkeypatch):
+    df = _rf(f"{DF}/dt=20260102/data.parquet", b"df")
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [df])
+
+    summary = mds.run_modelscope_daily_sync(skip_datasets=["daily_forward"])
+
+    assert summary["status"] == "up_to_date"
+    assert _FakeClient.stream_calls == 0
+
+
+def test_skip_whitespace_duplicates_normalized(env_root, monkeypatch):
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [wide])
+
+    report = ms.diff_from_modelscope(
+        skip_datasets=["  factor_dictionary  ", "factor_dictionary", ""]
+    )
+
+    assert "factor_dictionary" in report["skipped_by_config"]["datasets"]
+    assert report["total_pending_files"] == 0
+
+
+def test_guard_summary_skipped_metadata(env_root, monkeypatch):
+    big = _rf(f"{DF}/dt=20260102/data.parquet", b"xx")
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"wide",
+        dataset="factor_dictionary",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [big, wide])
+
+    no_skip = mds.run_modelscope_daily_sync(max_pending_gb=1e-9)
+    assert no_skip["status"] == "guard"
+    assert "skipped_datasets" not in no_skip
+    assert "hint" not in no_skip
+
+    ineffective = mds.run_modelscope_daily_sync(
+        datasets=["daily_forward"],
+        skip_datasets=["factor_dictionary"],
+        max_pending_gb=1e-9,
+    )
+    assert ineffective["status"] == "guard"
+    assert "skipped_datasets" not in ineffective
+
+    effective = mds.run_modelscope_daily_sync(
+        skip_datasets=["factor_dictionary"], max_pending_gb=1e-9
+    )
+    assert effective["status"] == "guard"
+    assert effective["skipped_datasets"] == ["factor_dictionary"]
+    assert "hint" in effective
+
+
+def test_skipped_report_includes_remote_total(env_root, monkeypatch):
+    wide = _rf(
+        "6_ml_datasets/factor_dictionary/dt=20260101/data.parquet",
+        b"a",
+        dataset="factor_dictionary",
+    )
+    l1_l2 = _rf(
+        "6_ml_datasets/l1_l2_factors/dt=20260101/data.parquet",
+        b"bb",
+        dataset="l1_l2_factors",
+    )
+    monkeypatch.setattr(ms, "list_remote_files", lambda **kw: [wide, l1_l2])
+
+    report = ms.diff_from_modelscope(
+        skip_datasets=["factor_dictionary", "l1_l2_factors"]
+    )
+
+    skipped = report["skipped_by_config"]
+    assert skipped["total_skipped_remote_files"] == 2
+    assert skipped["total_pending_files"] == 2
+    assert skipped["total_pending_bytes"] == 3
+    assert report["total_remote_files"] == 0

@@ -1100,6 +1100,7 @@ def _upsert_state_rows_multi(
 def _enumerate_and_diff(
     datasets: list[str] | None,
     *,
+    skip_datasets: list[str] | None = None,
     repo_id: str | None,
     revision: str | None,
     endpoint: str | None,
@@ -1120,6 +1121,14 @@ def _enumerate_and_diff(
         if unknown:
             raise ValueError(f"未知数据集: {', '.join(sorted(unknown))}")
 
+    skip_set = {str(s).strip() for s in (skip_datasets or ()) if str(s).strip()}
+    if skip_set:
+        unknown_skip = skip_set - known
+        if unknown_skip:
+            raise ValueError(f"未知数据集: {', '.join(sorted(unknown_skip))}")
+        if datasets is not None:
+            skip_set &= set(datasets)
+
     root = resolve_data_root()
     _progress(progress_cb, "phase", phase="enumerate", message="枚举魔搭远端清单")
     remote = list_remote_files(
@@ -1136,6 +1145,13 @@ def _enumerate_and_diff(
             raise ValueError(
                 f"魔搭仓库中不存在这些数据集: {', '.join(sorted(missing))}"
             )
+
+    # 配置里主动跳过的数据集：从下载/护栏/总量中摘除，但单独统计「本来要下多少」
+    skipped_grouped: dict[str, list[RemoteFile]] = {}
+    for _name in sorted(skip_set):
+        _files = grouped.pop(_name, None)
+        if _files:
+            skipped_grouped[_name] = _files
 
     sha_sets = _load_state_sha_sets(root)
     pending_by_ds: dict[str, list[RemoteFile]] = {}
@@ -1164,6 +1180,30 @@ def _enumerate_and_diff(
             "latest_local_dt": _latest_local_dt(root, spec.rel_dir),
             "pending_samples": [f.path for f in pending[:5]],
         }
+    skipped_per_dataset: dict[str, Any] = {}
+    skipped_pending_total = 0
+    skipped_pending_bytes_total = 0
+    skipped_remote_total = 0
+    for spec in DATASETS:
+        skipped_files = skipped_grouped.get(spec.dataset)
+        if not skipped_files:
+            continue
+        _kp_skippable, _kp_pending = _split_pending(root, skipped_files, sha_sets)
+        _kp_bytes = sum(f.size for f in _kp_pending)
+        skipped_pending_total += len(_kp_pending)
+        skipped_pending_bytes_total += _kp_bytes
+        skipped_remote_total += len(skipped_files)
+        skipped_per_dataset[spec.dataset] = {
+            "name": spec.name,
+            "rel_dir": spec.rel_dir,
+            "layout": spec.layout,
+            "remote_files": len(skipped_files),
+            "pending_files": len(_kp_pending),
+            "pending_bytes": _kp_bytes,
+            "latest_remote_dt": _latest_remote_dt(skipped_files),
+            "latest_local_dt": _latest_local_dt(root, spec.rel_dir),
+        }
+
     report = {
         "root": str(root),
         "repo_id": repo_id or _repo_id(),
@@ -1175,6 +1215,12 @@ def _enumerate_and_diff(
         "total_remote_files": sum(len(v) for v in grouped.values()),
         "total_pending_files": total_pending_files,
         "total_pending_bytes": total_pending_bytes,
+        "skipped_by_config": {
+            "datasets": skipped_per_dataset,
+            "total_skipped_remote_files": skipped_remote_total,
+            "total_pending_files": skipped_pending_total,
+            "total_pending_bytes": skipped_pending_bytes_total,
+        },
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     return root, grouped, pending_by_ds, report
@@ -1183,6 +1229,7 @@ def _enumerate_and_diff(
 def diff_from_modelscope(
     datasets: list[str] | None = None,
     *,
+    skip_datasets: list[str] | None = None,
     repo_id: str | None = None,
     revision: str | None = None,
     endpoint: str | None = None,
@@ -1193,9 +1240,14 @@ def diff_from_modelscope(
 
     返回按数据集的 pending_files/pending_bytes/latest_remote_dt/latest_local_dt
     等，用于每日任务预检（--check）与增量护栏判断。
+
+    total_remote_files / total_pending_* 只统计本轮参与同步的数据集；
+    skip_datasets 指定的数据集单独列在 skipped_by_config（含
+    total_skipped_remote_files），既不下载也不登记状态库。
     """
     _root, _grouped, _pending, report = _enumerate_and_diff(
         datasets,
+        skip_datasets=skip_datasets,
         repo_id=repo_id,
         revision=revision,
         endpoint=endpoint,
@@ -1208,6 +1260,7 @@ def diff_from_modelscope(
 def sync_incremental_from_modelscope(
     datasets: list[str] | None = None,
     *,
+    skip_datasets: list[str] | None = None,
     dry_run: bool = False,
     max_pending_bytes: int = DEFAULT_MAX_PENDING_BYTES,
     allow_large: bool = False,
@@ -1230,6 +1283,7 @@ def sync_incremental_from_modelscope(
     started = time.time()
     root, _grouped, pending_by_ds, report = _enumerate_and_diff(
         datasets,
+        skip_datasets=skip_datasets,
         repo_id=repo_id,
         revision=revision,
         endpoint=endpoint,
@@ -1242,9 +1296,12 @@ def sync_incremental_from_modelscope(
     pending_files = report["total_pending_files"]
     pending_bytes = report["total_pending_bytes"]
     if pending_files == 0:
+        _skip_cfg = report.get("skipped_by_config") or {}
         log.info(
-            "[MODELSCOPE] 远端无增量（%d 个文件全部已对齐）",
+            "[MODELSCOPE] 范围内无增量（%d 个文件全部已对齐；按配置跳过 %d 个数据集 / %d 个文件）",
             report["total_remote_files"],
+            len(_skip_cfg.get("datasets") or {}),
+            _skip_cfg.get("total_skipped_remote_files", 0),
         )
         return {
             "status": "up_to_date",
