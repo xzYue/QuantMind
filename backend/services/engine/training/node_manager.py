@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -602,6 +603,11 @@ awk '{print $1}' /proc/loadavg 2>/dev/null
     # GPU 容器探测 TTL 缓存（秒）：避免前端轮询时频繁起探针容器
     _gpu_probe_cache: tuple[float, list[dict[str, Any]]] | None = None
     _GPU_PROBE_TTL_SEC = 60
+    # 探针容器命名/标签：便于 docker ps 辨认，也便于按 label 清理历史残留
+    _GPU_PROBE_NAME_PREFIX = "qm-gpu-probe-"
+    _GPU_PROBE_LABEL = "qm.gpu-probe"
+    # 探针挂死时的兜底超时，避免拖住节点状态采集
+    _GPU_PROBE_TIMEOUT_SEC = 15
 
     @classmethod
     async def _probe_gpu_via_docker(
@@ -618,15 +624,23 @@ awk '{print $1}' /proc/loadavg 2>/dev/null
             return cls._gpu_probe_cache[1]
 
         gpus: list[dict[str, Any]] = []
+        container = None
         try:
             import docker as docker_sdk
 
-            out = await asyncio.to_thread(
-                client.containers.run,
+            # 覆盖镜像 ENTRYPOINT（默认训练镜像为 python /app/train.py）：
+            # 否则 nvidia-smi 命令会被 train.py 当作 CLI 参数吞掉，
+            # config 缺失秒退，探针永远返回空 → GPU 机器被误判为 CPU。
+            #
+            # 不能用 containers.run(..., remove=True)：SDK 的 remove=True 只在容器
+            # 正常退出后才删。宿主机没有 NVIDIA runtime 时容器 create 成功、start
+            # 失败（"failed to discover GPU vendor from CDI"），异常抛出后容器原地
+            # 残留成 Created 空壳（2026-11 本机积了 16 个随机名容器）。
+            # 因此显式 create → start → wait → logs，并在 finally 里无条件删除。
+            container = await asyncio.to_thread(
+                client.containers.create,
                 image,
-                # 覆盖镜像 ENTRYPOINT（默认训练镜像为 python /app/train.py）：
-                # 否则 nvidia-smi 命令会被 train.py 当作 CLI 参数吞掉，
-                # config 缺失秒退，探针永远返回空 → GPU 机器被误判为 CPU。
+                name=f"{cls._GPU_PROBE_NAME_PREFIX}{uuid.uuid4().hex[:8]}",
                 entrypoint=["nvidia-smi"],
                 command=[
                     "--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,name",
@@ -635,8 +649,11 @@ awk '{print $1}' /proc/loadavg 2>/dev/null
                 device_requests=[
                     docker_sdk.types.DeviceRequest(count=-1, capabilities=[["gpu"]])
                 ],
-                remove=True,
+                labels={cls._GPU_PROBE_LABEL: "1"},
             )
+            await asyncio.to_thread(container.start)
+            await asyncio.to_thread(container.wait, timeout=cls._GPU_PROBE_TIMEOUT_SEC)
+            out = await asyncio.to_thread(container.logs)
             if isinstance(out, bytes):
                 out = out.decode(errors="replace")
             for line in str(out).splitlines():
@@ -651,6 +668,13 @@ awk '{print $1}' /proc/loadavg 2>/dev/null
                     })
         except Exception as exc:
             logger.warning("docker GPU probe failed: %s", exc)
+        finally:
+            # 无论 start/wait 是否失败都要删：失败路径不删就会留下 Created 空壳
+            if container is not None:
+                try:
+                    await asyncio.to_thread(container.remove, force=True)
+                except Exception as exc:
+                    logger.warning("docker GPU probe cleanup failed: %s", exc)
         cls._gpu_probe_cache = (now, gpus)
         return gpus
 

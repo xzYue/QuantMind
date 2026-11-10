@@ -116,3 +116,75 @@ def test_collect_signal_kill_twice_reports_offline():
     assert out["online"] is False
     assert "code=-11" in str(out.get("error"))
     assert calls["n"] == 2
+
+
+def _probe_with_fake_client(fake_client):
+    """跑一次 GPU 容器探针（重置 60s TTL 缓存，避免测试间互相污染）。"""
+    import asyncio
+
+    NodeStatus._gpu_probe_cache = None
+    try:
+        return asyncio.run(
+            NodeStatus._probe_gpu_via_docker(fake_client, "quantmind-oss:latest")
+        )
+    finally:
+        NodeStatus._gpu_probe_cache = None
+
+
+def test_probe_gpu_parses_output_and_removes_container():
+    """成功路径：解析 nvidia-smi 输出，且探针容器被删除。"""
+    from unittest.mock import MagicMock
+
+    container = MagicMock()
+    container.logs.return_value = b"12, 1024, 24576, 45, NVIDIA GeForce RTX 4090\n"
+    client = MagicMock()
+    client.containers.create.return_value = container
+
+    gpus = _probe_with_fake_client(client)
+
+    assert gpus == [
+        {
+            "util": 12,
+            "mem_used_mb": 1024,
+            "mem_total_mb": 24576,
+            "temp_c": 45,
+            "name": "NVIDIA GeForce RTX 4090",
+        }
+    ]
+    container.start.assert_called_once()
+    container.remove.assert_called_once_with(force=True)
+    kwargs = client.containers.create.call_args.kwargs
+    assert kwargs["name"].startswith("qm-gpu-probe-")
+    assert kwargs["labels"] == {"qm.gpu-probe": "1"}
+
+
+def test_probe_gpu_removes_container_when_start_fails():
+    """回归：start 失败（无 NVIDIA CDI）时不能残留 Created 空壳，且不抛异常。
+
+    2026-11 本机 Docker Desktop 上每次打开节点状态页都会漏一个 Created 容器，
+    根因是 containers.run(remove=True) 只在容器正常退出后才删。
+    """
+    from unittest.mock import MagicMock
+
+    container = MagicMock()
+    container.start.side_effect = RuntimeError(
+        "failed to discover GPU vendor from CDI: no known GPU vendor found"
+    )
+    client = MagicMock()
+    client.containers.create.return_value = container
+
+    assert _probe_with_fake_client(client) == []
+    container.remove.assert_called_once_with(force=True)
+
+
+def test_probe_gpu_swallows_cleanup_failure():
+    """清理自身失败时只告警，不影响返回值。"""
+    from unittest.mock import MagicMock
+
+    container = MagicMock()
+    container.start.side_effect = RuntimeError("no gpu")
+    container.remove.side_effect = RuntimeError("already gone")
+    client = MagicMock()
+    client.containers.create.return_value = container
+
+    assert _probe_with_fake_client(client) == []
