@@ -957,15 +957,23 @@ async def import_remote_model(
     "/api/v1/hub/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"]
 )
 async def proxy_model_hub(path: str, request: Request):
-    api_key = _require_api_key()
+    # 读接口（列表/详情）在广场侧是公开的，本地未配置 Key 时允许匿名透传；
+    # 写接口（发布/点赞/上传凭证等）仍必须带 Key，由广场侧鉴权。
+    method = request.method.upper()
+    api_key = get_secret("QUANTDB_API_KEY")
+    if not api_key and method not in ("GET", "HEAD"):
+        raise HTTPException(
+            status_code=400,
+            detail="QUANTDB_API_KEY 未配置，无法访问模型广场。请在「个人中心 → 数据平台 QuantDB」中配置 API Key。",
+        )
 
     upstream_url = f"{HUB_BASE_URL}/api/v1/hub/{path}"
     if request.url.query:
         upstream_url += f"?{request.url.query}"
 
-    method = request.method.upper()
     headers = _forward_headers(request)
-    headers["X-API-Key"] = api_key
+    if api_key:
+        headers["X-API-Key"] = api_key
     body = await request.body()
 
     timeout = httpx.Timeout(connect=5.0, read=60.0, write=60.0, pool=10.0)

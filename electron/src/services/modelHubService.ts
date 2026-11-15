@@ -1,6 +1,6 @@
 import axios, { AxiosInstance } from 'axios';
 import { authService } from '../features/auth/services/authService';
-import { SERVICE_ENDPOINTS } from '../config/services';
+import { isElectronEnv, SERVICE_ENDPOINTS } from '../config/services';
 
 export interface HubModelItem {
   id: string;
@@ -85,6 +85,33 @@ class ModelHubService {
   }
 
   /**
+   * 读接口双通道：浏览器（Web）下同源网关优先，避免 QuantDB 侧缺 CORS 头导致每次先失败再兜底；
+   * Electron 桌面端保持直连优先（主进程已关闭 webSecurity，直连少一跳）。
+   */
+  private async hubGet<T>(path: string, params?: Record<string, unknown>): Promise<T> {
+    const direct = () => this.axiosInstance.get<T>(`/api/v1${path}`, { params });
+    const viaGateway = () =>
+      axios.get<T>(`${SERVICE_ENDPOINTS.API_GATEWAY}${path}`, {
+        params,
+        headers: { Authorization: `Bearer ${authService.getAccessToken() || ''}` },
+      });
+    const [primary, secondary] = isElectronEnv()
+      ? [direct, viaGateway]
+      : [viaGateway, direct];
+
+    try {
+      return (await primary()).data;
+    } catch (err) {
+      console.warn(`请求模型广场 ${path} 失败，切换备用通道:`, err);
+      try {
+        return (await secondary()).data;
+      } catch {
+        throw err;
+      }
+    }
+  }
+
+  /**
    * 写操作（上传/发布/点赞/下架）经平台网关代理转发到模型广场，
    * 由后端注入服务端已配置的 QUANTDB_API_KEY，前端无需携带明文 Key。
    */
@@ -129,43 +156,22 @@ class ModelHubService {
     page?: number;
     page_size?: number;
   }): Promise<HubModelListResponse> {
-    try {
-      const resp = await this.axiosInstance.get('/api/v1/hub/models', {
-        params: {
-          market: params.market && params.market !== 'ALL' ? params.market : undefined,
-          algorithm: params.algorithm && params.algorithm !== 'ALL' ? params.algorithm : undefined,
-          sort_by: params.sort_by || 'sharpe',
-          q: params.query || undefined,
-          author: params.author || undefined,
-          page: params.page || 1,
-          page_size: params.page_size || 20,
-        },
-      });
-      return resp.data;
-    } catch (err: any) {
-      console.warn('请求 QuantDB 模型广场失败，尝试使用本地网关回退:', err);
-      // 回退使用统一网关
-      const fallbackUrl = `${SERVICE_ENDPOINTS.API_GATEWAY}/api/v1/hub/models`;
-      const fallbackResp = await axios.get(fallbackUrl, {
-        params,
-        headers: {
-          Authorization: `Bearer ${authService.getAccessToken() || ''}`,
-        },
-      }).catch(() => null);
-
-      if (fallbackResp?.data) {
-        return fallbackResp.data;
-      }
-      throw err;
-    }
+    return this.hubGet<HubModelListResponse>('/hub/models', {
+      market: params.market && params.market !== 'ALL' ? params.market : undefined,
+      algorithm: params.algorithm && params.algorithm !== 'ALL' ? params.algorithm : undefined,
+      sort_by: params.sort_by || 'sharpe',
+      q: params.query || undefined,
+      author: params.author || undefined,
+      page: params.page || 1,
+      page_size: params.page_size || 20,
+    });
   }
 
   /**
    * 获取单个模型详情（含净值曲线与特征列表）
    */
   async getModelDetail(modelId: string): Promise<HubModelItem> {
-    const resp = await this.axiosInstance.get(`/api/v1/hub/models/${modelId}`);
-    return resp.data;
+    return this.hubGet<HubModelItem>(`/hub/models/${modelId}`);
   }
 
   /**
@@ -208,8 +214,7 @@ class ModelHubService {
    * 获取下载直链（仅作备用；常规导入应走后端 importRemoteModel 落库）
    */
   async getDownloadTicket(modelId: string): Promise<DownloadTicketResponse> {
-    const resp = await this.axiosInstance.get(`/api/v1/hub/models/${modelId}/download-ticket`);
-    return resp.data;
+    return this.hubGet<DownloadTicketResponse>(`/hub/models/${modelId}/download-ticket`);
   }
 
   /**
