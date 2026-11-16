@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- QuantMind Web dev server（Vite，默认 3001），由 launchd 托管：
+       崩溃自动重启、脱离 DSH 会话进程组，不再“过几小时自己消失”。
+       一次性加载：launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.quantmind.webdev.plist
+       停止/卸载：launchctl bootout gui/$(id -u)/com.quantmind.webdev -->
+  <key>Label</key>
+  <string>com.quantmind.webdev</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zeren/code/QuantMind/scripts/web-dev-server.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/zeren/code/QuantMind</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/quantmind-webdev.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/quantmind-webdev.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/zeren</string>
+  </dict>
+</dict>
+</plist>
