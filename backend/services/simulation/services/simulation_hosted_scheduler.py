@@ -27,6 +27,16 @@ from backend.services.simulation.services.rebalance_calculator import StrategyCo
 logger = logging.getLogger(__name__)
 
 _SH_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def bootstrap_lock_key(tenant_id: str, user_id: str, strategy_id: str) -> str:
+    """同一策略 24h 内只做一次启动建仓；调度器据此跳过 bootstrap 当天。"""
+    return (
+        "qm:hosted:simulation:bootstrap:"
+        f"{tenant_id}:{user_id}:{strategy_id}"
+    )
+
+
 _DEFAULT_LIVE_TRADE_CONFIG: dict[str, Any] = {
     "rebalance_days": 3,
     "schedule_type": "interval",
@@ -499,6 +509,7 @@ def _should_trigger(
     now: datetime,
     live_trade_config: dict[str, Any],
     started_day: date | None,
+    bootstrap_done: bool = False,
 ) -> SimulationScheduleDecision:
     local_now = now.astimezone(_SH_TZ)
     now_hhmm = local_now.strftime("%H:%M")
@@ -509,6 +520,17 @@ def _should_trigger(
 
     if not _is_enabled_session(now_hhmm, live_trade_config):
         return SimulationScheduleDecision(False, "IDLE", trade_date, "outside_session")
+
+    # 启动当天的首个 cycle 已按最新价建仓（或正在跑）。14:45 再按交易日
+    # 索引算一次，rebalance_days 会命中第 0 天，重复只买 1 手碎单。
+    if (
+        bootstrap_done
+        and started_day is not None
+        and started_day == local_now.date()
+    ):
+        return SimulationScheduleDecision(
+            False, "IDLE", trade_date, "bootstrap_day_skip"
+        )
 
     schedule_type = str(live_trade_config.get("schedule_type") or "interval").lower()
     if schedule_type == "weekly":
@@ -765,10 +787,22 @@ class SimulationHostedScheduler:
             active_data.get("live_trade_config")
         )
         started_day = _parse_started_at(active_data.get("started_at"))
+        bootstrap_done = False
+        try:
+            client = getattr(self.redis, "client", None)
+            if client is not None:
+                bootstrap_done = bool(
+                    client.exists(
+                        bootstrap_lock_key(tenant_id, user_id, strategy_id)
+                    )
+                )
+        except Exception:
+            bootstrap_done = False
         decision = _should_trigger(
             now=now,
             live_trade_config=live_trade_config,
             started_day=started_day,
+            bootstrap_done=bootstrap_done,
         )
         if not decision.should_trigger:
             return False

@@ -21,6 +21,9 @@ class QuoteView:
     symbol: str
     price: float
     pct_chg: float | None = None
+    # 快照时间与当前时间的差（秒）。None 表示上游快照没有时间字段，
+    # 无法判断新鲜度；风控扫描只会拒绝「明确过期」的报价。
+    age_seconds: float | None = None
 
 
 @dataclass

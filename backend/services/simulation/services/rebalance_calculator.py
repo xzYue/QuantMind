@@ -92,6 +92,9 @@ class StrategyConfig:
     min_score: float = 0.0
     max_position_pct: float = 0.15  # 单只股票最大仓位比例
     lot_size: int = 100  # 最小交易单位
+    # 单笔买入最小金额（元）。0=不过滤；模拟盘默认由 SIM_MIN_ORDER_AMOUNT 设为 5000。
+    # 只拦 BUY（碎单），SELL 不清仓会留下残仓，必须放行。
+    min_order_amount: float = 0.0
 
     # ── 动态仓位 / 动态股票池（默认关闭，保持既有策略行为不变）──
     # dynamic_exposure=True 时，用当日全市场信号均分决定总仓位：
@@ -348,7 +351,15 @@ class RebalanceCalculator:
             )
 
         # 5. 生成调仓指令（先卖后买）
-        # score_order 用于买单确定性排序；force_exit 让跌停持仓也能生成卖单
+        # score_order 用于买单确定性排序；force_exit 让跌停持仓也能生成卖单。
+        # 碎单阈值按账户规模封顶：小账户（如 1 万）全量 topk 时单笔目标
+        # 可能只有几百元，固定 5000 会把整个建仓拦掉；取 min(配置值, 2% NAV)。
+        min_order_amount = float(strategy.min_order_amount or 0.0)
+        total_asset = float(getattr(account, "total_asset", 0.0) or 0.0)
+        if min_order_amount > 0 and total_asset > 0:
+            min_order_amount = min(
+                min_order_amount, max(100.0, total_asset * 0.02)
+            )
         orders = self._generate_orders(
             account.positions,
             target_positions,
@@ -357,6 +368,7 @@ class RebalanceCalculator:
             if strategy.deterministic_buy_order
             else None,
             force_exit_on_limit_down=strategy.force_exit_on_limit_down,
+            min_order_amount=min_order_amount,
         )
 
         logger.info(
@@ -791,6 +803,7 @@ class RebalanceCalculator:
         quotes: dict[str, Quote],
         score_order: list[str] | None = None,
         force_exit_on_limit_down: bool = False,
+        min_order_amount: float = 0.0,
     ) -> list[Order]:
         """
         生成调仓指令（先卖后买）。
@@ -849,6 +862,17 @@ class RebalanceCalculator:
                 price = quote.current_price if quote else 0
 
                 if buy_qty > 0 and price > 0:
+                    amount = buy_qty * price
+                    if min_order_amount > 0 and amount < min_order_amount:
+                        logger.info(
+                            "RebalanceCalculator: %s 碎单跳过 buy=%d amount=%.2f "
+                            "< min_order_amount=%.2f",
+                            symbol,
+                            buy_qty,
+                            amount,
+                            min_order_amount,
+                        )
+                        continue
                     buy_orders.append(Order(
                         symbol=symbol,
                         side="BUY",

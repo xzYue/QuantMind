@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -130,11 +131,18 @@ def test_ensure_redis_attaches_connected_trade_client():
 
 
 def test_ticks_from_bars_marks_local_daily_close_source():
-    bar = MagicMock(close=12.5)
+    bar = MagicMock(close=12.5, trade_date=date(2026, 11, 13))
     ticks = SimulationEngine._ticks_from_bars({"600000.SH": bar})
-    assert ticks["600000.SH"]["price"] == 12.5
-    assert ticks["600000.SH"]["price_source"] == "local_daily_close"
+    tick = ticks["600000.SH"]
+    assert tick["price"] == 12.5
+    assert tick["price_source"] == "local_daily_close"
     assert "SH600000" in ticks
+    # 本地日线也必须带真实时间戳，否则下游会把陈旧报价当成 0 秒新鲜。
+    expected = datetime(
+        2026, 11, 13, 15, 0, tzinfo=timezone(timedelta(hours=8))
+    ).timestamp()
+    assert tick["timestamp"] == pytest.approx(expected)
+    assert tick["age_s"] is not None
 
 
 @pytest.mark.asyncio
@@ -220,6 +228,7 @@ async def test_bootstrap_run_uses_local_bars_when_realtime_empty():
         )
 
     load_bars.assert_awaited_once()
+    assert load_bars.await_args.kwargs.get("require_fresh") is True
     assert report.error is None
     assert report.filled_count == 1
     assert exec_order.await_args.kwargs.get("allow_stale_fill") is True

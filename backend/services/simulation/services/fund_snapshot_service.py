@@ -408,9 +408,11 @@ class SimulationFundSnapshotService:
                 )
                 await session.execute(stmt)
                 upserted += 1
-                # 同步轻量日台账行：EOD 未跑时智能图表/审计仍有 account_daily 可读
-                await cls._upsert_account_daily_summary(session, row)
-            # 把存量 fund_snapshots 中缺失的 account_daily 补齐（只插缺的，不覆盖当日已写行以外的历史）
+                # 周期采集只写资金快照（source=periodic）；simulation_account_daily
+                # 是历史日曲线口径，唯一写入方是 EOD 日终链路（同事务与 EOD
+                # 资金快照成对提交），避免盘中临时值被当成收盘定稿。
+            # 把存量 EOD 资金快照中缺失的 account_daily 补齐（只补 EOD 口径，
+            # 周期快照永远不进入历史日账）
             seen_users = {(str(t), str(u)) for (t, u) in grouped}
             for tenant_id, user_id in seen_users:
                 await cls._backfill_missing_account_daily(session, tenant_id, user_id)
@@ -421,7 +423,7 @@ class SimulationFundSnapshotService:
     async def _backfill_missing_account_daily(
         session, tenant_id: str, user_id: str
     ) -> None:
-        """为尚未有 account_daily 的 fund_snapshot 日期补写汇总行。"""
+        """为尚未有 account_daily 的 EOD fund_snapshot 日期补写汇总行。"""
         from sqlalchemy import select
 
         from backend.services.simulation.models.account_daily import (
@@ -446,6 +448,7 @@ class SimulationFundSnapshotService:
                     select(SimulationFundSnapshot).where(
                         SimulationFundSnapshot.tenant_id == tenant_id,
                         SimulationFundSnapshot.user_id == user_id,
+                        SimulationFundSnapshot.source == EOD_FUND_SOURCE,
                     )
                 )
             )

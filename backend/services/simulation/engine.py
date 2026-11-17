@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -58,6 +58,21 @@ from backend.shared.strategy_storage import get_strategy_storage_service
 
 logger = logging.getLogger(__name__)
 
+
+class StaleLocalMarketDataError(RuntimeError):
+    """本地日线最新分区落后于应有交易日，拒绝按旧价成交。"""
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 _STRATEGY_KWARG_KEYS = (
     "topk",
     "n_drop",
@@ -66,6 +81,7 @@ _STRATEGY_KWARG_KEYS = (
     "min_score",
     "max_position_pct",
     "lot_size",
+    "min_order_amount",
     "custom_weights",
     "enable_min_score",
     "renormalize_weights",
@@ -473,7 +489,20 @@ class SimulationEngine:
                     # 改为按缺失标的补齐本地日线，实时行情优先不被覆盖。
                     missing = [s for s in symbols if s not in quotes]
                     if missing:
-                        bars = await self._load_bars(missing, market=market)
+                        try:
+                            bars = await self._load_bars(
+                                missing, market=market, require_fresh=True
+                            )
+                        except StaleLocalMarketDataError as exc:
+                            report.error = str(exc)
+                            logger.error(
+                                "SimulationEngine: bootstrap stale local data, "
+                                "cycle rejected tenant=%s user=%s: %s",
+                                tenant,
+                                uid,
+                                exc,
+                            )
+                            return report
                         bar_quotes = self._quotes_from_bars(bars)
                         bar_ticks = self._ticks_from_bars(bars)
                         if bar_quotes:
@@ -791,8 +820,11 @@ class SimulationEngine:
         """
         rules = rules_for(market)
         default_lot = rules.lot_size
+        default_min_order = _env_float("SIM_MIN_ORDER_AMOUNT", 5000.0)
         # 默认配置
-        config = StrategyConfig(lot_size=default_lot)
+        config = StrategyConfig(
+            lot_size=default_lot, min_order_amount=default_min_order
+        )
         code_kwargs: dict[str, Any] = {}
         params: dict[str, Any] = {}
 
@@ -841,6 +873,9 @@ class SimulationEngine:
                     min_score=float(params.get("min_score", 0.0)),
                     max_position_pct=float(params.get("max_position_pct", 0.15)),
                     lot_size=int(params.get("lot_size", default_lot)),
+                    min_order_amount=float(
+                        params.get("min_order_amount", default_min_order)
+                    ),
                     n_drop=int(params.get("n_drop", 0) or 0),
                     rebalance_days=max(1, int(params.get("rebalance_days", 1) or 1)),
                     enable_min_score=bool(params.get("enable_min_score", False)),
@@ -883,6 +918,10 @@ class SimulationEngine:
                 config.max_position_pct = float(params_override["max_position_pct"])
             if params_override.get("lot_size") is not None:
                 config.lot_size = int(params_override["lot_size"])
+            if params_override.get("min_order_amount") is not None:
+                config.min_order_amount = float(
+                    params_override["min_order_amount"]
+                )
             if params_override.get("n_drop") is not None:
                 config.n_drop = int(params_override["n_drop"])
             if params_override.get("rebalance_days") is not None:
@@ -937,15 +976,73 @@ class SimulationEngine:
         symbols: list[str],
         as_of: date | None = None,
         market: Any = None,
+        require_fresh: bool = False,
     ) -> dict[str, Any]:
         if not symbols:
             return {}
         market_data = get_local_market_data(market)
         trade_date = as_of or datetime.now().date()
         latest = await asyncio.to_thread(market_data.latest_trade_date, trade_date)
+        if require_fresh:
+            self._assert_local_data_fresh(latest, market)
         if latest is not None:
             trade_date = latest
         return await asyncio.to_thread(market_data.load_date, trade_date, symbols)
+
+    @staticmethod
+    def _expected_previous_trading_day(current: date) -> date:
+        """当前时点应当已经落盘的最新收盘交易日（不含今天）。"""
+        from backend.shared.inference_coverage import trading_dates_between
+
+        dates = trading_dates_between(
+            current - timedelta(days=30), current - timedelta(days=1)
+        )
+        if dates:
+            return date.fromisoformat(dates[-1])
+        candidate = current - timedelta(days=1)
+        while candidate.weekday() >= 5:
+            candidate -= timedelta(days=1)
+        return candidate
+
+    @classmethod
+    def _assert_local_data_fresh(cls, latest: date | None, market: Any) -> None:
+        """bootstrap 只允许使用「上一交易日」及更新的日线成交。
+
+        模拟撮合按本地不复权日线收盘价成交。若数据同步尚未落盘，旧实现会
+        静默取最近一个分区（实测差 6 个交易日），导致按一周前价格建仓。
+        这里把「允许陈旧到哪天」变成显式闸门。
+
+        默认允许 1 个交易日延迟：凌晨 bootstrap 时，上一交易日的日线通常
+        要等 01:20 的数据同步才落盘，零容忍会让每个新建策略都启动失败。
+        """
+        if getattr(market, "value", market) not in (None, "CN"):
+            return
+        expected = cls._expected_previous_trading_day(datetime.now().date())
+        max_gap = max(0, int(_env_float("SIM_LOCAL_DATA_MAX_STALE_SESSIONS", 1)))
+        if latest is None:
+            raise StaleLocalMarketDataError(
+                f"stale_local_market_data: latest=None expected={expected} gap=None"
+            )
+        if latest >= expected:
+            return
+        from backend.shared.inference_coverage import trading_dates_between
+
+        gap_dates = trading_dates_between(latest, expected)
+        if gap_dates:
+            gap = len(gap_dates) - 1
+        else:
+            # 交易日历不可用时按工作日兜底，至少不能把缺失当成新鲜。
+            gap = 0
+            cursor = latest + timedelta(days=1)
+            while cursor <= expected:
+                if cursor.weekday() < 5:
+                    gap += 1
+                cursor += timedelta(days=1)
+        if gap > max_gap:
+            raise StaleLocalMarketDataError(
+                f"stale_local_market_data: latest={latest} "
+                f"expected={expected} gap={gap}"
+            )
 
     async def _load_live_quotes(
         self, symbols: list[str]
@@ -1006,8 +1103,34 @@ class SimulationEngine:
 
     @staticmethod
     def _ticks_from_bars(bars: dict[str, Any]) -> dict[str, dict[str, Any]]:
-        """将本地日线 bar 转成 execute_order 可用的 tick 字典（bootstrap 兜底）。"""
+        """将本地日线 bar 转成 execute_order 可用的 tick 字典（bootstrap 兜底）。
+
+        timestamp 取该分区交易日 15:00（Asia/Shanghai）收盘时刻。旧实现写
+        None，成交审计被格式化成 quote_age_s=0.0，看起来像实时价。
+        """
         ticks: dict[str, dict[str, Any]] = {}
+        bar_date: date | None = None
+        for bar in bars.values():
+            value = getattr(bar, "trade_date", None)
+            if isinstance(value, datetime):
+                bar_date = value.date()
+                break
+            if isinstance(value, date):
+                bar_date = value
+                break
+        close_at = (
+            datetime.combine(
+                bar_date, time(15, 0), tzinfo=timezone(timedelta(hours=8))
+            )
+            if bar_date is not None
+            else None
+        )
+        timestamp = close_at.timestamp() if close_at is not None else None
+        age_s = (
+            max(0.0, datetime.now(timezone.utc).timestamp() - timestamp)
+            if timestamp is not None
+            else None
+        )
         for sym, bar in bars.items():
             price = float(getattr(bar, "close", 0) or 0)
             if price <= 0:
@@ -1015,8 +1138,8 @@ class SimulationEngine:
             tick = {
                 "price": price,
                 "price_source": "local_daily_close",
-                "timestamp": None,
-                "age_s": None,
+                "timestamp": timestamp,
+                "age_s": age_s,
             }
             for key in {
                 sym,

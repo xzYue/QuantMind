@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,7 @@ from backend.services.live_trading.services.risk_lock import (
     already_fired,
     mark_fired,
     write_account_lock,
+    write_symbol_cooldown,
     write_symbol_lock,
 )
 from backend.services.live_trading.services.risk_rule_types import is_trigger_rule
@@ -179,6 +181,103 @@ def _snapshot_keys(symbol: str) -> list[str]:
     return list(dict.fromkeys(keys))
 
 
+_QUOTE_TS_FIELDS = (
+    "timestamp",
+    "time",
+    "update_time",
+    "updateTime",
+    "ts",
+    "datetime",
+)
+
+
+def _parse_quote_timestamp(value: Any) -> datetime | None:
+    """把快照时间解析成上海时区 aware datetime。
+
+    上游历史上有三种写法：epoch 秒/毫秒、带时区的 ISO、以及不带时区的
+    ``2026-02-19T14:10:08``（上海墙钟）。只解析失败才返回 None。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except (TypeError, ValueError):
+        numeric = None
+    if numeric is not None:
+        if numeric > 1e12:  # 毫秒
+            numeric /= 1000.0
+        if numeric <= 0:
+            return None
+        try:
+            return datetime.fromtimestamp(numeric, tz=_SH_TZ)
+        except (OSError, OverflowError, ValueError):
+            return None
+    candidate = text.replace("Z", "+00:00")
+    # 只有 ``14:10:08`` 时按今天补齐
+    if len(candidate) <= 8 and ":" in candidate:
+        try:
+            parsed_time = time.fromisoformat(candidate)
+        except ValueError:
+            return None
+        return datetime.combine(datetime.now(_SH_TZ).date(), parsed_time, tzinfo=_SH_TZ)
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_SH_TZ)
+    return parsed.astimezone(_SH_TZ)
+
+
+def quote_age_seconds(
+    data: Mapping[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> float | None:
+    if not data:
+        return None
+    timestamp = None
+    for field in _QUOTE_TS_FIELDS:
+        timestamp = _parse_quote_timestamp(data.get(field))
+        if timestamp is not None:
+            break
+    if timestamp is None:
+        return None
+    current = now or datetime.now(_SH_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=_SH_TZ)
+    else:
+        current = current.astimezone(_SH_TZ)
+    return max(0.0, (current - timestamp).total_seconds())
+
+
+def max_quote_age_seconds() -> float:
+    raw = os.getenv("RISK_TRIGGER_MAX_QUOTE_AGE_SEC", "180")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 180.0
+
+
+def filter_stale_quotes(
+    quotes: Mapping[str, QuoteView],
+    *,
+    max_age_seconds: float | None = None,
+) -> dict[str, QuoteView]:
+    """丢弃明确过期的报价；没有时间字段的报价保留（无法判定）。"""
+    limit = max_quote_age_seconds() if max_age_seconds is None else max_age_seconds
+    if limit <= 0:
+        return dict(quotes)
+    return {
+        symbol: quote
+        for symbol, quote in quotes.items()
+        if quote.age_seconds is None or quote.age_seconds <= limit
+    }
+
+
 def quote_from_hash(symbol: str, data: Mapping[str, Any] | None) -> QuoteView | None:
     if not data:
         return None
@@ -221,7 +320,12 @@ def quote_from_hash(symbol: str, data: Mapping[str, Any] | None) -> QuoteView | 
             if prev > 0:
                 pct_chg = (price - prev) / prev
                 break
-    return QuoteView(symbol=symbol, price=price, pct_chg=pct_chg)
+    return QuoteView(
+        symbol=symbol,
+        price=price,
+        pct_chg=pct_chg,
+        age_seconds=quote_age_seconds(data),
+    )
 
 
 def fetch_quotes_from_redis(redis: Any, symbols: list[str]) -> dict[str, QuoteView]:
@@ -473,6 +577,14 @@ async def execute_candidate(
         write_account_lock(redis, tenant_id, user_id, trade_date)
     else:
         write_symbol_lock(redis, tenant_id, user_id, trade_date, candidate.symbol)
+        # 只对模拟盘生效：实盘止损后是否允许立即买回应由用户/券商规则决定，
+        # 不能被平台默认冷却期改写。冷却 TTL 用 SIM_STOP_LOSS_COOLDOWN_SECONDS，
+        # 不复用 candidate.cooldown_seconds（那是规则触发冷却，量级完全不同）。
+        if (
+            candidate.rule_type == "position_stop_loss"
+            and str(candidate.trading_mode or "").upper() == "SIMULATION"
+        ):
+            write_symbol_cooldown(redis, tenant_id, user_id, candidate.symbol)
     mark_fired(
         redis,
         candidate.rule_id,

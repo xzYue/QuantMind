@@ -328,7 +328,8 @@ def test_issue34_repro_periodic_then_eod_same_valuation(monkeypatch):
     redis = FakeRedisClient({"simulation:account:default:1": _account_json(10000.0)})
     asyncio.run(Svc.capture_all(redis, snapshot_date=TRADE_DATE))
     assert db.fund[("default", "1", TRADE_DATE)]["total_asset"] == 10000.0
-    assert db.acct_daily[("default", "1", TRADE_DATE)]["total_asset"] == 10000.0
+    # 周期采集不写历史日账：account_daily 只能由 EOD 日终链路定稿
+    assert ("default", "1", TRADE_DATE) not in db.acct_daily
 
     # EOD：同一事务内用同一份重估（9900）配对写日账+资金快照
     session = FakeSession(db)

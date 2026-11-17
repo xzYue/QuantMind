@@ -251,6 +251,17 @@ class SignalLoader:
             hosted = await manual_execution_service.get_default_model_hosted_status(
                 tenant_id=tenant_id, user_id=user_id
             )
+            if not hosted.get("available"):
+                # 过期/未进入窗口的批次不能兜底：data_trade_date 仍会返回，
+                # 照着它读 pred.parquet 等于用早已失效的信号继续下单。
+                logger.warning(
+                    "SignalLoader: 默认模型批次不可用，跳过 pred.parquet 兜底 "
+                    "tenant=%s user=%s reason=%s",
+                    tenant_id,
+                    user_id,
+                    hosted.get("reason_code"),
+                )
+                return []
             model_id = str(hosted.get("latest_default_model_id") or "").strip()
             data_trade_date = str(hosted.get("data_trade_date") or "").strip()[:10]
             if not model_id or not data_trade_date:

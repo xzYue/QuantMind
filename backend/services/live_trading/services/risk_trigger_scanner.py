@@ -14,6 +14,7 @@ from backend.services.live_trading.services.risk_trigger_service import (
     ensure_risk_events_table,
     evaluate_user_account,
     fetch_quotes_from_redis,
+    filter_stale_quotes,
     is_cn_continuous_auction,
     load_implicit_stop_loss,
     load_trigger_rules,
@@ -37,6 +38,21 @@ def scan_interval_seconds() -> int:
 
 def scan_enabled() -> bool:
     return os.getenv("RISK_SCAN_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _fresh_quotes(quotes: dict[str, Any], *, context: str) -> dict[str, Any]:
+    """行情延迟超过阈值时本轮不自动卖，等下一次扫描拿到新价再触发。
+
+    远端行情 Redis 抖动时快照可能滞后数分钟；用旧价触发止损会把
+    「当时的亏损」当成「现在的亏损」直接成交。宁可晚一轮，不拿过期价交易。
+    """
+    fresh = filter_stale_quotes(quotes)
+    dropped = len(quotes) - len(fresh)
+    if dropped:
+        logger.warning(
+            "risk scanner: 跳过 %d 条过期报价 context=%s", dropped, context
+        )
+    return fresh
 
 
 class RiskTriggerScanner:
@@ -128,8 +144,14 @@ class RiskTriggerScanner:
                 if not isinstance(positions, dict) or not positions:
                     continue
                 implicit = load_implicit_stop_loss(self.redis, tenant_id, raw_user)
-                quotes = fetch_quotes_from_redis(
-                    self.redis, collect_needed_symbols(positions, rules + ([implicit] if implicit else []))
+                quotes = _fresh_quotes(
+                    fetch_quotes_from_redis(
+                        self.redis,
+                        collect_needed_symbols(
+                            positions, rules + ([implicit] if implicit else [])
+                        ),
+                    ),
+                    context=f"simulation:{tenant_id}:{user_id}:{market}",
                 )
                 candidates = evaluate_user_account(
                     positions=positions,
@@ -174,9 +196,14 @@ class RiskTriggerScanner:
                 positions = _positions_from_real_payload(row.get("payload") or {})
                 if not positions:
                     continue
-                quotes = fetch_quotes_from_redis(
-                    self.redis,
-                    collect_needed_symbols(positions, real_rules + ([implicit] if implicit else [])),
+                quotes = _fresh_quotes(
+                    fetch_quotes_from_redis(
+                        self.redis,
+                        collect_needed_symbols(
+                            positions, real_rules + ([implicit] if implicit else [])
+                        ),
+                    ),
+                    context=f"real:{tenant_id}:{user_id}:CN",
                 )
                 if implicit is not None:
                     implicit.parameters = {

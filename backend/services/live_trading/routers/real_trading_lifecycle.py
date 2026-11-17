@@ -20,6 +20,7 @@ from backend.services.live_trading.services.manual_execution_service import (
     manual_execution_service,
 )
 from backend.services.simulation.services.simulation_hosted_scheduler import (
+    bootstrap_lock_key,
     hosted_trade_enabled,
     run_simulation_cycle_for_active,
 )
@@ -463,13 +464,20 @@ async def start_trading(
         ):
             if os.getenv("SIM_BOOTSTRAP_FIRST_RUN_ENABLED", "true").strip().lower() == "true":
                 try:
-                    bootstrap_lock_key = (
-                        f"qm:hosted:simulation:bootstrap:{resolved_tenant_id}:{resolved_user_id}:{strategy_id or strategy_name}"
+                    bootstrap_key = bootstrap_lock_key(
+                        resolved_tenant_id,
+                        resolved_user_id,
+                        str(strategy_id or strategy_name),
                     )
                     bootstrap_task_id = f"bootstrap_{run_id}_{strategy_id or strategy_name}"
                     # 24h 内同一策略只 bootstrap 一次，避免重复启动短时间内重复建单
                     try:
-                        acquired = redis.client.set(bootstrap_lock_key, bootstrap_task_id, ex=24 * 3600, nx=True)
+                        acquired = redis.client.set(
+                            bootstrap_key,
+                            bootstrap_task_id,
+                            ex=24 * 3600,
+                            nx=True,
+                        )
                     except Exception:
                         acquired = True  # Redis 异常不阻断，仍尝试建单（靠 task_id 去重兜底）
                     if acquired:
@@ -486,13 +494,13 @@ async def start_trading(
                                     "trigger": "bootstrap_first_run",
                                 },
                             )
-                            if bootstrap_result.get("status") == "failed":
+                            if bootstrap_result.get("status") in {"failed", "skipped"}:
                                 bootstrap_skipped_reason = str(
                                     bootstrap_result.get("error") or "simulation cycle failed"
                                 )[:300]
-                                # 失败不占 24h 锁，否则重置后再启动仍被跳过
+                                # 失败/无信号不占 24h 锁：调度器当天仍可补跑
                                 try:
-                                    redis.client.delete(bootstrap_lock_key)
+                                    redis.client.delete(bootstrap_key)
                                 except Exception:
                                     pass
                             logger.info(
@@ -503,7 +511,7 @@ async def start_trading(
                             )
                         except Exception:
                             try:
-                                redis.client.delete(bootstrap_lock_key)
+                                redis.client.delete(bootstrap_key)
                             except Exception:
                                 pass
                             raise

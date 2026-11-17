@@ -776,9 +776,14 @@ return tostring(granted)
         order.order_value = trade_value
         order.execution_model = "synthetic_price"
         order.price_source = result.price_source
+        quote_age = (
+            f"{float(result.quote_age_seconds):.1f}"
+            if result.quote_age_seconds is not None
+            else "unknown"
+        )
         audit = (
             f"quote_ts={result.quote_timestamp or 'unknown'} "
-            f"quote_age_s={float(result.quote_age_seconds or 0.0):.1f}"
+            f"quote_age_s={quote_age}"
         )
         order.remarks = f"{order.remarks or ''} [{audit}]".strip()[:500]
 
