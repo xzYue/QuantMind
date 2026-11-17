@@ -192,6 +192,9 @@ def test_quote_age_and_stale_filter():
     now = datetime(2026, 11, 17, 15, 0, tzinfo=SH)
     age = quote_age_seconds({"timestamp": now.timestamp() - 30}, now=now)
     assert age == pytest.approx(30.0)
+    # 日期型 timestamp 不能被当成 1970 年的 epoch 秒
+    date_age = quote_age_seconds({"timestamp": "20261117145900"}, now=now)
+    assert date_age == pytest.approx(60.0)
 
     fresh = QuoteView(symbol="600000.SH", price=10.0, age_seconds=30.0)
     stale = QuoteView(symbol="600001.SH", price=10.0, age_seconds=600.0)

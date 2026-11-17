@@ -207,6 +207,15 @@ def _parse_quote_timestamp(value: Any) -> datetime | None:
     except (TypeError, ValueError):
         numeric = None
     if numeric is not None:
+        # 快照 timestamp 标准口径是 epoch 秒，但部分源把日期写成
+        # YYYYMMDD / YYYYMMDDHHMMSS。8/14 位整数若按 epoch 解析会落到
+        # 1970 年，被新鲜度过滤误杀成「全部过期」。
+        if text.isdigit() and len(text) in (8, 14) and numeric > 1e7:
+            fmt = "%Y%m%d" if len(text) == 8 else "%Y%m%d%H%M%S"
+            try:
+                return datetime.strptime(text, fmt).replace(tzinfo=_SH_TZ)
+            except ValueError:
+                return None
         if numeric > 1e12:  # 毫秒
             numeric /= 1000.0
         if numeric <= 0:
