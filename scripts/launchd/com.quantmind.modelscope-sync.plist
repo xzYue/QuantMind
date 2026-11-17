@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- ModelScope 每日增量同步（守卫调度，macOS 睡眠后自动补跑）
+       机制：launchd 在 07:00 触发；另每小时 tick 一次 + 登录/唤醒后 RunAtLoad 兜底；
+             脚本内部用「当日完成标记 + 目录锁」保证每天最多成功一次、不会与 cron 并发。
+       一次性加载：把本文件 cp 到 ~/Library/LaunchAgents/ 后执行
+                   launchctl bootstrap gui/<uid> ~/Library/LaunchAgents/com.quantmind.modelscope-sync.plist
+                   （完整步骤见 docs/数据管理结构与同步覆盖语义.md 第 7 节）
+       停止/卸载：launchctl bootout gui/<uid>/com.quantmind.modelscope-sync -->
+  <!-- 注意：下面的仓库绝对路径与 HOME 值需按本机实际路径调整（换机器/换账号后不改会静默失败） -->
+  <key>Label</key>
+  <string>com.quantmind.modelscope-sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/zeren/code/QuantMind/backend/scripts/modelscope_daily_sync_guard.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/zeren/code/QuantMind</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>7</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <key>ThrottleInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/tmp/quantmind-modelscope-guard.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/quantmind-modelscope-guard.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/zeren</string>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+    <key>no_proxy</key>
+    <string>*</string>
+    <key>NO_PROXY</key>
+    <string>*</string>
+  </dict>
+</dict>
+</plist>
