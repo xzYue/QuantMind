@@ -11,12 +11,13 @@ import {
   Search,
   ShieldCheck,
   SquareTerminal,
-  TestTube2,
+  Dna,
   FileText,
   Sparkles,
   Brain,
   BarChart3,
   Cpu,
+  TrendingUp,
   CandlestickChart,
 } from 'lucide-react';
 import { useSelector } from 'react-redux';
@@ -44,7 +45,7 @@ export const FloatingNavBar: React.FC<FloatingNavBarProps> = ({ current, onChang
     // 1. 大盘分析模块
     { id: 'dashboard', label: marketLabel, icon: LayoutDashboard },
     { id: 'market-analysis', label: '市场分析', icon: BarChart3 },
-    { id: 'rss-news', label: 'RSS信息流', icon: Rss },
+    { id: 'rss-news', label: '新闻快讯', icon: Rss },
     { id: 'stock-terminal', label: '个股终端', icon: CandlestickChart },
     { id: 'ai-ide', label: 'AI-IDE', icon: SquareTerminal },
     { id: 'backtest', label: '回测中心', icon: FlaskConical },
@@ -53,9 +54,10 @@ export const FloatingNavBar: React.FC<FloatingNavBarProps> = ({ current, onChang
     { id: 'model-training', label: '模型训练', icon: Layers },
     { id: 'model-registry', label: '模型管理', icon: Boxes },
     { id: 'inference-center', label: '推理中心', icon: Cpu },
+    { id: 'review-center', label: '模型复盘', icon: TrendingUp },
     // 4. 智能投研区域
     { id: 'research', label: '投研平台', icon: Search },
-    { id: 'alpha-research', label: '因子挖掘', icon: TestTube2 },
+    { id: 'alpha-research', label: '因子挖掘', icon: Dna },
     { id: 'skills', label: '技能中心', icon: Sparkles },
     { id: 'agent', label: 'QuantBot', icon: Orbit },
     // 5. 个人中心
@@ -72,7 +74,7 @@ export const FloatingNavBar: React.FC<FloatingNavBarProps> = ({ current, onChang
     // 2. 回测与交易区域
     navItems.filter((item) => ['stock-terminal', 'ai-ide', 'backtest', 'trading'].includes(item.id)),
     // 3. 模型区域
-    navItems.filter((item) => ['model-training', 'model-registry', 'inference-center'].includes(item.id)),
+    navItems.filter((item) => ['model-training', 'model-registry', 'inference-center', 'review-center'].includes(item.id)),
     // 4. 智能投研区域
     navItems.filter((item) => ['research', 'alpha-research', 'skills', 'agent'].includes(item.id)),
     // 5. 个人与系统组

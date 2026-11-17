@@ -36,6 +36,7 @@ from backend.services.simulation.services.rebalance_calculator import (
     SimulationAccount,
     StrategyConfig,
     WeightMode,
+    dynamic_config_from_params,
 )
 from backend.services.simulation.services.market_rules import (
     infer_market_from_symbols,
@@ -70,6 +71,19 @@ _STRATEGY_KWARG_KEYS = (
     "renormalize_weights",
     "deterministic_buy_order",
     "force_exit_on_limit_down",
+    # 动态仓位 / 动态股票池（动态仓位TOPK、动态股票池TOPK）
+    "dynamic_exposure",
+    "score_threshold",
+    "pos_up",
+    "pos_down",
+    "target_exposure",
+    "defensive_universe",
+    "defensive_market",
+    # 快速崩盘过滤（动态风控 TOPK）
+    "crash_filter",
+    "crash_exposure",
+    "crash_ret10",
+    "crash_ret5",
 )
 
 
@@ -496,11 +510,31 @@ class SimulationEngine:
                 report.signal_count = len(signals)
                 report.st_filtered_count = st_dropped
                 report.fundamental_filtered_count = fundamental_dropped
+
+                market_crash = False
+                if getattr(strategy_config, "crash_filter", False):
+                    from backend.services.simulation.services.market_regime import (
+                        csi300_crash_active,
+                    )
+
+                    market_crash = await asyncio.to_thread(
+                        csi300_crash_active,
+                        self._market_data,
+                        datetime.now().date(),
+                        ret10_threshold=float(
+                            getattr(strategy_config, "crash_ret10", -0.06)
+                        ),
+                        ret5_threshold=float(
+                            getattr(strategy_config, "crash_ret5", -0.04)
+                        ),
+                    )
+
                 orders = self.rebalance_calculator.calculate(
                     signals=signals,
                     strategy=strategy_config,
                     quotes=quotes,
                     account=account,
+                    market_crash=market_crash,
                 )
                 orders = self._apply_risk_buy_locks(
                     orders, tenant=tenant, user_id=uid, trade_date=datetime.now().date()
@@ -760,6 +794,7 @@ class SimulationEngine:
         # 默认配置
         config = StrategyConfig(lot_size=default_lot)
         code_kwargs: dict[str, Any] = {}
+        params: dict[str, Any] = {}
 
         try:
             # 尝试从策略存储服务加载。注意身份口径：托管链路传的是运行时
@@ -872,6 +907,13 @@ class SimulationEngine:
                 config.n_drop,
                 config.weight_mode.value,
             )
+
+        # 动态仓位 / 动态股票池：params_override 优先，其次策略参数/代码 kwargs。
+        merged_params = dict(params)
+        if params_override:
+            merged_params.update(params_override)
+        for key, value in dynamic_config_from_params(merged_params).items():
+            setattr(config, key, value)
 
         return config
 

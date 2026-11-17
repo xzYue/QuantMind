@@ -17,6 +17,7 @@ from backend.services.simulation.services.ocr_service import SimulationOCRServic
 from backend.services.trade_shared.trade_config import settings
 from backend.shared.database_manager_v2 import get_db_manager
 from backend.shared.stock_utils import StockCodeUtil
+import asyncio
 import logging
 import httpx
 from sqlalchemy import text
@@ -34,6 +35,110 @@ def _to_quantdb_suffix(symbol: str) -> str:
     """prefix(SH600036) → suffix(600036.SH)；返回空即无法归一化，原样返回。"""
     suffix = StockCodeUtil.to_suffix(str(symbol or ""))
     return suffix or str(symbol or "")
+
+
+async def _enrich_positions_with_prev_close(
+    positions: dict | None,
+) -> None:
+    """给模拟持仓逐只补 `prev_close`（原地写入，失败静默跳过）。
+
+    背景：持仓 payload 只写 `price/market_value/cost`，前端当日收益
+    `(现价-昨收)*股数` 的昨收此前 100% 依赖 WS `pre_close` 推送；WS 断流、
+    快照超 300s 被丢弃或新订阅无差分不推送时，明细全 `--`。
+    此处用本地 QuantDB 日线（与撮合/EOD 同源）在 `/account` 单点补齐，昨收取
+    「最新交易日收盘价」（当日日线已同步时取当日 pre_close），前端
+    `pos.prev_close/pre_close/close_price` 兜底即生效；WS 仍可覆盖为更新值。
+    `remark` 只改现价不删键，补的键可保留。
+    """
+    if not isinstance(positions, dict) or not positions:
+        return
+    try:
+        wanted: list[str] = []
+        for _key, _pos in positions.items():
+            if not isinstance(_pos, dict):
+                continue
+            try:
+                _has = float(
+                    _pos.get("prev_close")
+                    or _pos.get("pre_close")
+                    or _pos.get("close_price")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                _has = 0.0
+            if _has > 0:
+                continue
+            _sym = str(_pos.get("symbol") or str(_key).split("::")[0] or "").strip()
+            if _sym:
+                wanted.append(_sym)
+        wanted = sorted(set(wanted))
+        if not wanted:
+            return
+
+        def _load() -> dict[str, float]:
+            from backend.services.simulation.services.local_market_data import (
+                get_local_market_data,
+            )
+
+            md = get_local_market_data()
+            latest = md.latest_trade_date()
+            if latest is None:
+                return {}
+            bars = md.load_date(latest, symbols=wanted)
+            if not bars:
+                return {}
+            # 昨收口径：最新交易日早于今天时，它的收盘价才是「今天」的昨收；
+            # 最新交易日就是今天（盘后当日日线已同步）时，昨收取当日 pre_close。
+            # 历史 BUG：一律取 DailyBar.pre_close（= 上一交易日收盘），昨收整体
+            # 差一个交易日，当日收益变成「两天涨跌合计」。
+            use_close = latest < date.today()
+            values: dict[str, float] = {}
+            for _sym, _bar in bars.items():
+                try:
+                    _value = float(
+                        getattr(_bar, "close" if use_close else "pre_close", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    continue
+                if _value <= 0:
+                    continue
+                try:
+                    values[StockCodeUtil.to_suffix(str(_sym)).upper()] = _value
+                except Exception:
+                    continue
+            return values
+
+        by_suffix = await asyncio.to_thread(_load)
+        if not by_suffix:
+            return
+        for _key, _pos in positions.items():
+            if not isinstance(_pos, dict):
+                continue
+            try:
+                _has = float(
+                    _pos.get("prev_close")
+                    or _pos.get("pre_close")
+                    or _pos.get("close_price")
+                    or 0
+                )
+            except (TypeError, ValueError):
+                _has = 0.0
+            if _has > 0:
+                continue
+            _sym = str(_pos.get("symbol") or str(_key).split("::")[0] or "").strip()
+            if not _sym:
+                continue
+            try:
+                _lookup = StockCodeUtil.to_suffix(_sym).upper() or _sym.upper()
+            except Exception:
+                _lookup = _sym.upper()
+            _pre = by_suffix.get(_lookup) or 0.0
+            if _pre > 0:
+                _pos["prev_close"] = round(_pre, 4)
+                _pos.setdefault("pre_close", round(_pre, 4))
+                _pos.setdefault("close_price", round(_pre, 4))
+    except Exception as exc:
+        logger.warning("Enrich sim prev_close failed: %s", exc)
 
 
 async def _get_latest_close_from_quantdb(symbol: str) -> float:
@@ -460,6 +565,10 @@ async def get_simulation_account(
             },
             "market": market,
         }
+
+    # 持仓自带昨收：WS 断流/快照过期/新订阅无差分时明细当日收益不再全 `--`。
+    # 只补缺失键、不覆盖已有值；失败不影响主流程（前端回退 WS）。
+    await _enrich_positions_with_prev_close(account.get("positions"))
 
     # 从 settings 中读取 initial_cash 作为 initial_equity
     settings = await manager.get_settings(
